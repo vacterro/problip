@@ -1681,7 +1681,7 @@ namespace Problip
             {
                 GlowTimer = new Timer();
                 GlowTimer.Interval = 16;
-                GlowTimer.Tick += delegate(object o, EventArgs ea) { OnGlowTick(); };
+                GlowTimer.Tick += OnGlowTick;
             }
             if (!GlowTimer.Enabled)
             {
@@ -1691,7 +1691,7 @@ namespace Problip
             Invalidate();
         }
 
-        void OnGlowTick()
+        void OnGlowTick(object sender, EventArgs e)
         {
             if (GlowStartMs < 0) { StopGlow(); return; }
             int elapsed = (int)(GlowClock.ElapsedMilliseconds - GlowStartMs);
@@ -1778,7 +1778,7 @@ namespace Problip
                 Engine.BlipPlayed -= OnBlipPlayed;
                 if (GlowTimer != null)
                 {
-                    GlowTimer.Tick -= delegate(object o, EventArgs ea) { OnGlowTick(); };
+                    GlowTimer.Tick -= OnGlowTick;
                     GlowTimer.Dispose();
                     GlowTimer = null;
                 }

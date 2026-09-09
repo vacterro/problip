@@ -635,7 +635,7 @@ try {
         $onBlipM.Invoke($form, $blipArgs)
         for ($i = 0; $i -lt 100; $i++) {
             $onBlipM.Invoke($form, $blipArgs)   # restart from peak/rise origin
-            $formType.GetMethod('OnGlowTick', $nonPublic).Invoke($form, @())
+            $formType.GetMethod('OnGlowTick', $nonPublic).Invoke($form, [object[]]@($null, $null))
             try { $onPaint.Invoke($form, [object[]]@([System.Windows.Forms.PaintEventArgs]$peGlow)) } catch { }
         }
         Check 'repeated glow events never stack beyond the 25 percent cap' ([double]$glowAlphaM.Invoke($form, @()) -le 0.25)
