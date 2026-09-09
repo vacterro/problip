@@ -1,0 +1,28 @@
+# runtime user state
+problip.ini
+problip.stats.ini
+problip.stats.ini.tmp
+dist/
+
+# build artifacts
+*.exe
+*.obj
+*.pdb
+*.cache/
+
+# python
+__pycache__/
+*.pyc
+
+# visual studio transients
+.vs/
+bin/
+obj/
+
+# os noise
+Thumbs.db
+.DS_Store
+
+# local donor/reference material and protocol state (never shipped)
+.freebuff/
+.saipen/
