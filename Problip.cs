@@ -38,6 +38,10 @@ namespace Problip
     // for a UI thread and cheap (one reference assignment per switch).
     class ProblipPalette
     {
+        // The thirteen DONOR palette slots (Android Palettes.kt, verbatim):
+        // Bg, Surface, Raised, Bevel, BDark, Gold, TextMain, TextDim, Muted,
+        // Compare, Success, Warning, Danger. All fifteen themes carry every
+        // slot; the donor values are never substituted or "improved".
         public Color BG;
         public Color SURFACE;
         public Color RAISED;
@@ -49,28 +53,82 @@ namespace Problip
         public Color MUTED;
         public Color COMPARE;
         public Color SUCCESS;
+        public Color WARNING;    // donor Warning: separate slot, never Success/Danger
         public Color DANGERTXT;
-        // Windows-only secondary slots. Derived from the donor palette in the
-        // constructor so a themed session never mixes, say, a Dracula background
-        // with a Golden Default slider fill (the ALT slot paints the volume
-        // thumb) and no palette can forget to define them.
+        // Windows-only ADDITIONAL state. ALT is not donor metadata: it paints
+        // the real volume-slider thumb. Two ways to supply it:
+        //   - an explicit historical Windows value (Golden Default's 0x453D30,
+        //     the pre-theme hard-coded thumb fill -- NOT the Surface/Raised
+        //     midpoint), or
+        //   - a deterministic Surface/Raised midpoint when no explicit Windows
+        //     value exists. Derived and explicit stay distinct on purpose so a
+        //     compatibility value is never passed off as a derivation.
         public Color ALT;
         public ProblipPalette(Color bg, Color surface, Color raised, Color bevel, Color bdark,
                               Color link, Color text, Color text2, Color muted,
-                              Color compare, Color success, Color dangerTxt)
+                              Color compare, Color success, Color warning, Color dangerTxt)
+            : this(bg, surface, raised, bevel, bdark, link, text, text2, muted,
+                   compare, success, warning, dangerTxt, null) { }
+        public ProblipPalette(Color bg, Color surface, Color raised, Color bevel, Color bdark,
+                              Color link, Color text, Color text2, Color muted,
+                              Color compare, Color success, Color warning, Color dangerTxt,
+                              Color? alt)
         {
             BG = bg; SURFACE = surface; RAISED = raised; BEVEL = bevel; BDARK = bdark;
             LINK = link; TEXT = text; TEXT2 = text2; MUTED = muted;
-            COMPARE = compare; SUCCESS = success; DANGERTXT = dangerTxt;
-            // Deterministic midpoint between Surface and Raised: sits between
-            // the two filled tones for every palette, so no theme is left with a
-            // Golden Default slider fragment. For Golden Default this is the
-            // derived 0x383226 (the former hard-coded 0x453D30 was a one-off
-            // constant; the derived value keeps the same visual role).
-            ALT = Color.FromArgb(
+            COMPARE = compare; SUCCESS = success; WARNING = warning; DANGERTXT = dangerTxt;
+            // Explicit Windows ALT wins; otherwise the deterministic midpoint
+            // between Surface and Raised, which sits between the two filled
+            // tones for every palette.
+            ALT = alt ?? Color.FromArgb(
                 (surface.R + raised.R) / 2,
                 (surface.G + raised.G) / 2,
                 (surface.B + raised.B) / 2);
+        }
+
+        // ---- Selected-label readability (pure visual helper) ----
+        // Selected buttons/text paint on the COMPARE background with LINK as the
+        // preferred accent. Some palettes (Vintage Classic: near-white LINK on
+        // light-silver COMPARE) make that pairing unreadable. This helper picks
+        // the readable foreground deterministically instead of mutating any
+        // donor color: prefer the accent when it has adequate contrast against
+        // the selected background, otherwise fall back to the normal text color.
+        public const double SelectedContrastMinimum = 4.5;
+
+        // WCAG 2.x relative luminance: sRGB channels linearized, then
+        // luma-weighted. Deterministic, no I/O, no WinForms -- directly
+        // driven by the theme regression.
+        public static double RelativeLuminance(Color c)
+        {
+            double R = Channel(c.R), G = Channel(c.G), B = Channel(c.B);
+            return 0.2126 * R + 0.7152 * G + 0.0722 * B;
+        }
+        static double Channel(int v)
+        {
+            double s = v / 255.0;
+            return s <= 0.03928 ? s / 12.92 : Math.Pow((s + 0.055) / 1.055, 2.4);
+        }
+
+        // WCAG contrast ratio of two colors, (L1+0.05)/(L2+0.05), range 1..21.
+        public static double ContrastRatio(Color a, Color b)
+        {
+            double la = RelativeLuminance(a), lb = RelativeLuminance(b);
+            double hi = Math.Max(la, lb), lo = Math.Min(la, lb);
+            return (hi + 0.05) / (lo + 0.05);
+        }
+
+        // The selected-label foreground: the accent when it is readable on the
+        // selected background (>= 4.5:1), else the normal text color.
+        public static Color SelectedForeground(Color background, Color preferredAccent, Color normalText)
+        {
+            return ContrastRatio(preferredAccent, background) >= SelectedContrastMinimum
+                ? preferredAccent : normalText;
+        }
+
+        // This palette's selected-label color, against its own COMPARE fill.
+        public Color SelectedText()
+        {
+            return SelectedForeground(COMPARE, LINK, TEXT);
         }
     }
 
@@ -93,9 +151,13 @@ namespace Problip
         public static Color MUTED     { get { return Current.MUTED; } }
         public static Color COMPARE   { get { return Current.COMPARE; } }
         public static Color SUCCESS   { get { return Current.SUCCESS; } }
+        public static Color WARNING   { get { return Current.WARNING; } }
         public static Color DANGERTXT { get { return Current.DANGERTXT; } }
         public static Color ALT       { get { return Current.ALT; } }
         public static Color LINK      { get { return Current.LINK; } }
+        // Selected-label foreground: accent when readable on COMPARE, else the
+        // normal text color (see ProblipPalette.SelectedForeground).
+        public static Color SelectedText { get { return Current.SelectedText(); } }
     }
 
     // The tray and window icon both come from problip.ico, whose frames are the
@@ -503,39 +565,44 @@ namespace Problip
         // ---- The fifteen literal Wintage palettes (donor values, never improved).
         // Slot mapping from the donor: BG<-Bg, SURFACE<-Surface, RAISED<-Raised,
         // BEVEL<-Bevel, BDARK<-BDark, LINK<-Gold, TEXT<-TextMain, TEXT2<-TextDim,
-        // MUTED<-Muted, COMPARE<-Compare, SUCCESS<-Success, DANGERTXT<-Danger.
+        // MUTED<-Muted, COMPARE<-Compare, SUCCESS<-Success, WARNING<-Warning,
+        // DANGERTXT<-Danger. Golden Default additionally carries the explicit
+        // historical Windows ALT 0x453D30 -- the pre-theme hard-coded volume-thumb
+        // fill; it is a Windows compatibility value, not the Surface/Raised
+        // midpoint, and every other palette derives its ALT instead.
         internal static ProblipPalette BuildClassicPalette()
         {
             return P(C(0x1A1810), C(0x332E22), C(0x3D372A), C(0x75663D), C(0x100E08),
                      C(0xF0D060), C(0xD4C89A), C(0x9C9371), C(0x6E674E), C(0x14120C),
-                     C(0x4A7A20), C(0xD66464));
+                     C(0x4A7A20), C(0x7A7A20), C(0xD66464), C(0x453D30));
         }
         static ProblipPalette P(Color bg, Color surface, Color raised, Color bevel, Color bdark,
                                 Color link, Color text, Color text2, Color muted,
-                                Color compare, Color success, Color dangerTxt)
+                                Color compare, Color success, Color warning, Color dangerTxt,
+                                Color? windowsAlt = null)
         {
             return new ProblipPalette(bg, surface, raised, bevel, bdark, link, text, text2,
-                                      muted, compare, success, dangerTxt);
+                                      muted, compare, success, warning, dangerTxt, windowsAlt);
         }
         static Color C(int rgb)
         {
             return Color.FromArgb((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
         }
 
-        static ProblipPalette PalGolden()         { return P(C(0x342012), C(0x4A341B), C(0x5A4324), C(0x826941), C(0x1C1208), C(0xD3B57A), C(0xE2CA95), C(0xC5AB6E), C(0x95804C), C(0x24170C), C(0x5B9630), C(0xD37676)); }
-        static ProblipPalette PalClaudecode()     { return P(C(0x29241D), C(0x3B362A), C(0x484436), C(0x75644F), C(0x15130F), C(0xD1A27C), C(0xE0B997), C(0xC39870), C(0x93704E), C(0x1C1914), C(0x5B9630), C(0xD37575)); }
-        static ProblipPalette PalAntigravity()    { return P(C(0x1B1F2C), C(0x272B3E), C(0x31354D), C(0x4B6678), C(0x0D0F17), C(0x7AD0D3), C(0x95DEE2), C(0x6EBFC5), C(0x4C8F95), C(0x12151E), C(0x5B9630), C(0xD06D6D)); }
-        static ProblipPalette PalKlite()          { return P(C(0x212325), C(0x303235), C(0x3C3F42), C(0x5E6165), C(0x111213), C(0xA2A5AB), C(0xB8BABF), C(0x95989E), C(0x6D6F74), C(0x171819), C(0x5B9630), C(0xD27272)); }
-        static ProblipPalette PalFreebuff()       { return P(C(0x1B232B), C(0x28303D), C(0x333B4B), C(0x506B5F), C(0x0E1116), C(0x89D37A), C(0xA0E295), C(0x7AC56E), C(0x55954C), C(0x13181D), C(0x5B9630), C(0xD27272)); }
-        static ProblipPalette PalCodenomad()      { return P(C(0x1C242A), C(0x29313C), C(0x343D4A), C(0x575776), C(0x0E1216), C(0x9D86D1), C(0xB099DE), C(0x9C84C8), C(0x675091), C(0x13181D), C(0x5B9630), C(0xD27272)); }
-        static ProblipPalette PalFpdefault()      { return P(C(0x1A1A1A), C(0x2B2B2B), C(0x343434), C(0x4E555B), C(0x0A0A0A), C(0x839BB0), C(0xC0C0C0), C(0x949494), C(0x656565), C(0x141414), C(0x4A7A20), C(0xDB7575)); }
-        static ProblipPalette PalGoldenvintage()  { return P(C(0x0F0F0F), C(0x2B2B2B), C(0x333333), C(0x655E4A), C(0x050505), C(0xD6BE76), C(0xC4BA9F), C(0x8E8774), C(0x605C50), C(0x0B0B0B), C(0x4A7A20), C(0xD45C5C)); }
-        static ProblipPalette PalVintagedark()    { return P(C(0x181818), C(0x2B2B2B), C(0x343434), C(0x4A5258), C(0x0A0A0A), C(0x738EA6), C(0xC0C0C0), C(0x8E8E8E), C(0x646464), C(0x121212), C(0x4A7A20), C(0xD45D5D)); }
-        static ProblipPalette PalVintageclassic() { return P(C(0xC0C0C0), C(0xC0C0C0), C(0xD0D0D0), C(0xF6F6F6), C(0x808080), C(0xF6F6F6), C(0x000000), C(0x3A3A3A), C(0x6A6A6A), C(0xD0D0D0), C(0x4A7A20), C(0x7A2020)); }
-        static ProblipPalette PalOled()           { return P(C(0x000000), C(0x0A0A0A), C(0x141414), C(0x5C5C5C), C(0x1A1A1A), C(0xFFFFFF), C(0xA0A0A0), C(0x777777), C(0x484848), C(0x000000), C(0x4A7A20), C(0xCE4444)); }
-        static ProblipPalette PalDracula()        { return P(C(0x21222C), C(0x44475A), C(0x4C526D), C(0x706A9E), C(0x191A21), C(0xBD93F9), C(0xF8F8F2), C(0xB8B8B7), C(0x828285), C(0x191A21), C(0x4A7A20), C(0xDA7373)); }
-        static ProblipPalette PalNord()           { return P(C(0x272C36), C(0x3B4252), C(0x3F4758), C(0x566C7D), C(0x232831), C(0x88C0D0), C(0xD8DEE9), C(0xA3A9B3), C(0x777C87), C(0x1D2129), C(0x4A7A20), C(0xDE8282)); }
-        static ProblipPalette PalSolarized()      { return P(C(0x002B36), C(0x073642), C(0x1B444F), C(0x36667D), C(0x001F27), C(0x51A2DB), C(0x93A1A1), C(0x8D9EA1), C(0x426066), C(0x002029), C(0x4A7A20), C(0xDD7D7D)); }
+        static ProblipPalette PalGolden()         { return P(C(0x342012), C(0x4A341B), C(0x5A4324), C(0x826941), C(0x1C1208), C(0xD3B57A), C(0xE2CA95), C(0xC5AB6E), C(0x95804C), C(0x24170C), C(0x5B9630), C(0x969630), C(0xD37676)); }
+        static ProblipPalette PalClaudecode()     { return P(C(0x29241D), C(0x3B362A), C(0x484436), C(0x75644F), C(0x15130F), C(0xD1A27C), C(0xE0B997), C(0xC39870), C(0x93704E), C(0x1C1914), C(0x5B9630), C(0x969630), C(0xD37575)); }
+        static ProblipPalette PalAntigravity()    { return P(C(0x1B1F2C), C(0x272B3E), C(0x31354D), C(0x4B6678), C(0x0D0F17), C(0x7AD0D3), C(0x95DEE2), C(0x6EBFC5), C(0x4C8F95), C(0x12151E), C(0x5B9630), C(0x969630), C(0xD06D6D)); }
+        static ProblipPalette PalKlite()          { return P(C(0x212325), C(0x303235), C(0x3C3F42), C(0x5E6165), C(0x111213), C(0xA2A5AB), C(0xB8BABF), C(0x95989E), C(0x6D6F74), C(0x171819), C(0x5B9630), C(0x969630), C(0xD27272)); }
+        static ProblipPalette PalFreebuff()       { return P(C(0x1B232B), C(0x28303D), C(0x333B4B), C(0x506B5F), C(0x0E1116), C(0x89D37A), C(0xA0E295), C(0x7AC56E), C(0x55954C), C(0x13181D), C(0x5B9630), C(0x969630), C(0xD27272)); }
+        static ProblipPalette PalCodenomad()      { return P(C(0x1C242A), C(0x29313C), C(0x343D4A), C(0x575776), C(0x0E1216), C(0x9D86D1), C(0xB099DE), C(0x9C84C8), C(0x675091), C(0x13181D), C(0x5B9630), C(0x969630), C(0xD27272)); }
+        static ProblipPalette PalFpdefault()      { return P(C(0x1A1A1A), C(0x2B2B2B), C(0x343434), C(0x4E555B), C(0x0A0A0A), C(0x839BB0), C(0xC0C0C0), C(0x949494), C(0x656565), C(0x141414), C(0x4A7A20), C(0x7A7A20), C(0xDB7575)); }
+        static ProblipPalette PalGoldenvintage()  { return P(C(0x0F0F0F), C(0x2B2B2B), C(0x333333), C(0x655E4A), C(0x050505), C(0xD6BE76), C(0xC4BA9F), C(0x8E8774), C(0x605C50), C(0x0B0B0B), C(0x4A7A20), C(0x7A7A20), C(0xD45C5C)); }
+        static ProblipPalette PalVintagedark()    { return P(C(0x181818), C(0x2B2B2B), C(0x343434), C(0x4A5258), C(0x0A0A0A), C(0x738EA6), C(0xC0C0C0), C(0x8E8E8E), C(0x646464), C(0x121212), C(0x4A7A20), C(0x7A7A20), C(0xD45D5D)); }
+        static ProblipPalette PalVintageclassic() { return P(C(0xC0C0C0), C(0xC0C0C0), C(0xD0D0D0), C(0xF6F6F6), C(0x808080), C(0xF6F6F6), C(0x000000), C(0x3A3A3A), C(0x6A6A6A), C(0xD0D0D0), C(0x4A7A20), C(0x7A7A20), C(0x7A2020)); }
+        static ProblipPalette PalOled()           { return P(C(0x000000), C(0x0A0A0A), C(0x141414), C(0x5C5C5C), C(0x1A1A1A), C(0xFFFFFF), C(0xA0A0A0), C(0x777777), C(0x484848), C(0x000000), C(0x4A7A20), C(0x7A7A20), C(0xCE4444)); }
+        static ProblipPalette PalDracula()        { return P(C(0x21222C), C(0x44475A), C(0x4C526D), C(0x706A9E), C(0x191A21), C(0xBD93F9), C(0xF8F8F2), C(0xB8B8B7), C(0x828285), C(0x191A21), C(0x4A7A20), C(0x7A7A20), C(0xDA7373)); }
+        static ProblipPalette PalNord()           { return P(C(0x272C36), C(0x3B4252), C(0x3F4758), C(0x566C7D), C(0x232831), C(0x88C0D0), C(0xD8DEE9), C(0xA3A9B3), C(0x777C87), C(0x1D2129), C(0x4A7A20), C(0x7A7A20), C(0xDE8282)); }
+        static ProblipPalette PalSolarized()      { return P(C(0x002B36), C(0x073642), C(0x1B444F), C(0x36667D), C(0x001F27), C(0x51A2DB), C(0x93A1A1), C(0x8D9EA1), C(0x426066), C(0x002029), C(0x4A7A20), C(0x7A7A20), C(0xDD7D7D)); }
 
         // id -> palette. Every catalog id has exactly one palette; anything else
         // resolves to Golden Default (same rule as ById).
@@ -1612,10 +1679,15 @@ namespace Problip
         // Opens the single reusable theme picker. Wired by Program so the THEME
         // line and the tray Themes item share one window.
         public Action OpenThemes;
-        // Opens the single reusable theme picker from the tray-visible setting.
+        // Opens the single reusable Help window. Wired by Program so the title
+        // bar "?" button, F1 and the tray Help item share one instance.
+        public Action OpenHelp;
         internal Rectangle BlipsRect;
         // Mode-row hit zones (MANUAL / PULSE).
         internal Rectangle ManualRect, PulseRect;
+        // Title-bar geometry for the layout regression: the "?" Help button, the
+        // X close zone and the measured status text rectangle.
+        internal Rectangle HelpRect, CloseRect, StatusRect;
         // Utility-row hit zones (THEME / GLOW).
         internal Rectangle ThemeRect, GlowRect;
         // ── Blip Glow state ──
@@ -1803,11 +1875,26 @@ namespace Problip
                 if (x > 0x7FFF) x -= 0x10000;
                 if (y > 0x7FFF) y -= 0x10000;
                 Point p = PointToClient(new Point(x, y));
-                if (p.Y < 20 && p.X < Width - 20)
+                // The drag strip stops at the "?" Help button: its painted hot
+                // zone must receive the click, like the X close control beside it.
+                if (p.Y < 20 && p.X < HelpRect.X)
                 {
                     m.Result = (IntPtr)Native.HTCAPTION;
                 }
             }
+        }
+
+        // F1 belongs to the main form: open Help. The MANUAL editor's TextBoxes
+        // live on a separate top-level form, so its keyboard handling (and this
+        // dialog-key seam) never fires while that editor is active -- F1 cannot
+        // steal input from it.
+        protected override bool ProcessDialogKey(Keys keyData)
+        {
+            if ((keyData & Keys.KeyCode) == Keys.F1)
+            {
+                if (OpenHelp != null) { OpenHelp(); return true; }
+            }
+            return base.ProcessDialogKey(keyData);
         }
 
         // Font.FromHfont does NOT take ownership of the handle: every call leaks
@@ -1859,16 +1946,26 @@ namespace Problip
             using (var b = new SolidBrush(Palette.SURFACE)) g.FillRectangle(b, 0, 0, Width, 20);
             DrawText(g, "problip", 8, 4, Palette.TEXT, 12, true);
             var xr = new Rectangle(Width - 20, 0, 20, 20);
+            CloseRect = xr;
             Hot.Add(MakeHot(xr, delegate() { Hide(); }));
             DrawText(g, "X", Width - 16, 4, Palette.TEXT2, 12, true);
 
+            // "?" Help affordance: same custom pixel style, one 16x20 hot zone
+            // between the status text and the X close control. The drag strip in
+            // WndProc stops at this rectangle, so the click reaches the HotZone
+            // exactly as painted (same geometry drives both).
+            HelpRect = new Rectangle(Width - 40, 0, 16, 20);
+            Hot.Add(MakeHot(HelpRect, delegate() { if (OpenHelp != null) OpenHelp(); }));
+            DrawText(g, "?", Width - 37, 3, Palette.TEXT2, 12, true);
+
             // status — only the truth, top-right. A broken sound asset is its own
             // state: reporting ON while nothing can play is the defect this
-            // replaces.
+            // replaces. Ends 4 px left of the "?" affordance.
             string st = Engine.IsBroken ? "ERR" : (Engine.IsOn ? "ON" : "OFF");
             Color stc = Engine.IsBroken ? Palette.DANGERTXT : (Engine.IsOn ? Palette.SUCCESS : Palette.MUTED);
             int sw = (int)g.MeasureString(st, F(12)).Width;
-            DrawText(g, st, Width - 24 - sw, 4, stc, 12, true);
+            StatusRect = new Rectangle(Width - 44 - sw, 0, sw, 20);
+            DrawText(g, st, StatusRect.X, 4, stc, 12, true);
 
             // ── BLIPS total: one compact line under the title/status row ──
             // Dim text, no panel, no progress bar. Clicking it opens the shared
@@ -2026,7 +2123,7 @@ namespace Problip
                 g.FillRectangle(bg, r.X + 2, r.Y + 2, r.Width - 4, r.Height - 4);
             DrawBevel(g, r, !selected);
             Font f = F(pt);
-            using (var br = new SolidBrush(selected ? Palette.LINK : Palette.TEXT))
+            using (var br = new SolidBrush(selected ? Palette.SelectedText : Palette.TEXT))
                 g.DrawString(label, f, br, new RectangleF(r.X + 2, r.Y + 2, r.Width - 4, r.Height - 4), Centered);
         }
 
@@ -2635,7 +2732,7 @@ namespace Problip
             using (var bg = new SolidBrush(selected ? Palette.COMPARE : Palette.RAISED))
                 g.FillRectangle(bg, r.X + 2, r.Y + 2, r.Width - 4, r.Height - 4);
             DrawBevel(g, r, !selected);
-            using (var br = new SolidBrush(selected ? Palette.LINK : Palette.TEXT))
+            using (var br = new SolidBrush(selected ? Palette.SelectedText : Palette.TEXT))
                 g.DrawString(label, PixelFont, br, new RectangleF(r.X + 2, r.Y + 2, r.Width - 4, r.Height - 4), Centered);
         }
 
@@ -2854,11 +2951,15 @@ namespace Problip
                 using (var sb = new SolidBrush(swatchPalette.LINK))
                     g.FillRectangle(sb, sw.X + 1, sw.Y + 1, sw.Width - 2, sw.Height - 2);
 
-                // name: selected rows get the accent, the rest the plain text.
-                DrawText(g, entry.Name, 28, y + 3, selected ? Palette.LINK : Palette.TEXT, 10, selected);
+                // name: selected rows get the selected foreground, the rest the
+                // plain text (Vintage Classic LINK is near-white -- unreadable on
+                // the light selected row -- so the accent only shows when it is
+                // actually readable; see ProblipPalette.SelectedForeground).
+                Color selectedFg = selected ? Palette.SelectedText : Palette.TEXT;
+                DrawText(g, entry.Name, 28, y + 3, selectedFg, 10, selected);
 
                 // selection marker at the right edge, inside the client.
-                if (selected) DrawText(g, "*", Width - 14, y + 3, Palette.LINK, 10, true);
+                if (selected) DrawText(g, "*", Width - 14, y + 3, Palette.SelectedText, 10, true);
                 y += RowH;
             }
         }
@@ -3011,7 +3112,7 @@ namespace Problip
             using (var bg = new SolidBrush(selected ? Palette.COMPARE : Palette.RAISED))
                 g.FillRectangle(bg, r.X + 2, r.Y + 2, r.Width - 4, r.Height - 4);
             DrawBevel(g, r, !selected);
-            using (var br = new SolidBrush(selected ? Palette.LINK : Palette.TEXT))
+            using (var br = new SolidBrush(selected ? Palette.SelectedText : Palette.TEXT))
                 g.DrawString(label, F(pt), br, new RectangleF(r.X + 2, r.Y + 2, r.Width - 4, r.Height - 4), Centered);
         }
 
@@ -3108,12 +3209,245 @@ namespace Problip
         }
     }
 
+    // Single-source Windows Help text. HelpForm renders exactly what this
+    // returns and the regression inspects this string for the required
+    // sections -- no Help copy is scattered across any mouse handler.
+    // Windows-specific only: deliberately absent are the Android donor's
+    // premium/store/trial/developer sections (they describe a product that
+    // does not exist on Windows). No localization architecture yet.
+    static class HelpContent
+    {
+        // The full Help text: ALL-CAPS section headings (the pixel UI never
+        // uses a separate heading color/font), short body lines, FAQ pairs.
+        public static string Build()
+        {
+            var sb = new System.Text.StringBuilder();
+            H(sb, "QUICK START");
+            L(sb, "ON starts the periodic blips.");
+            L(sb, "OFF pauses them. The window can be closed (X) either way;");
+            L(sb, "PROBLIP stays in the tray.");
+            L(sb, "TEST plays one preview blip. It never changes the cadence.");
+            L(sb, "");
+            H(sb, "INTERVALS");
+            L(sb, "Range presets: 4-7, 5, 10, 15, 20 and 30 seconds.");
+            L(sb, "A preset with a span (4-7) picks a random second value each time.");
+            L(sb, "MANUAL opens the editor: FROM and TO, 1..3600 seconds each.");
+            L(sb, "Equal bounds (for example 20-20) are a fixed interval.");
+            L(sb, "PULSE alternates a fixed 5 s slot with a fresh random 10-20 s slot.");
+            L(sb, "The selected interval governs the FIRST blip of a session too.");
+            L(sb, "TEST never changes the timer.");
+            L(sb, "");
+            H(sb, "VOLUME");
+            L(sb, "Drag the slider; the level is saved and previewed on release.");
+            L(sb, "While dragging, nothing plays.");
+            L(sb, "Changing volume does not restart the countdown.");
+            L(sb, "");
+            H(sb, "RUNNING / STARTUP");
+            L(sb, "RunOnLaunch remembers whether the last session was ON or OFF");
+            L(sb, "and re-applies it on the next launch.");
+            L(sb, "Autostart controls whether Windows launches PROBLIP at login.");
+            L(sb, "The two are independent: autostart alone does not mean the");
+            L(sb, "blips run automatically -- that is RunOnLaunch.");
+            L(sb, "");
+            H(sb, "STATISTICS");
+            L(sb, "Today / this week / this month / total, in the Statistics view");
+            L(sb, "(tray menu or the BLIPS line).");
+            L(sb, "Only successful scheduled blips count. TEST does not count.");
+            L(sb, "Hiding the BLIPS display never stops the counting.");
+            L(sb, "");
+            H(sb, "THEMES");
+            L(sb, "Fifteen Wintage themes; the pick is remembered.");
+            L(sb, "Vintage Classic is the one light theme.");
+            L(sb, "");
+            H(sb, "BLIP GLOW");
+            L(sb, "Optional soft accent pulse on this window per scheduled blip.");
+            L(sb, "Only successful scheduled blips glow; TEST does not glow.");
+            L(sb, "");
+            H(sb, "TROUBLESHOOTING");
+            L(sb, "ERR usually means blip01.wav is missing, corrupt or unsupported.");
+            L(sb, "Restore the shipped blip01.wav beside Problip.exe, then press");
+            L(sb, "ON or TEST to recover -- no restart needed.");
+            L(sb, "To reset statistics, close PROBLIP first, then delete");
+            L(sb, "problip.stats.ini beside the executable.");
+            L(sb, "");
+            H(sb, "FAQ");
+            Q(sb, "Does TEST change the timer?", "No.");
+            Q(sb, "Does changing volume restart the timer?", "No.");
+            Q(sb, "Does hiding BLIPS stop statistics?", "No.");
+            Q(sb, "Does autostart mean blips automatically run?",
+              "Not necessarily; RunOnLaunch is separate.");
+            Q(sb, "Is data uploaded anywhere?", "No. Everything stays on this machine.");
+            return sb.ToString();
+        }
+        static void H(System.Text.StringBuilder sb, string heading)
+        {
+            if (sb.Length > 0) sb.Append("\r\n");
+            sb.Append(heading).Append("\r\n");
+        }
+        static void L(System.Text.StringBuilder sb, string line)
+        {
+            if (line.Length > 0) sb.Append(line);
+            sb.Append("\r\n");
+        }
+        static void Q(System.Text.StringBuilder sb, string question, string answer)
+        {
+            sb.Append("- ").Append(question).Append(" ").Append(answer).Append("\r\n");
+        }
+    }
+
+    // Compact read-only Help window. One reusable instance owned by Program
+    // (same ownership pattern as the statistics view), opened from the main
+    // window's title-bar "?", the tray Help item and F1 -- all three surfaces
+    // reuse this ONE form. Pure informational UI: it never touches the engine,
+    // scheduling, audio, statistics, glow or settings persistence. The content
+    // is a real WinForms TextBox (ReadOnly, borderless) -- the one narrow
+    // native-control exception to the custom-painted language, kept because it
+    // buys scrolling for free; the MAIN window remains non-scrollable.
+    class HelpForm : Form
+    {
+        TextBox Content;
+        Dictionary<int, Font> Fonts = new Dictionary<int, Font>();
+        StringFormat Centered = new StringFormat();
+        // Painted geometry, exposed for the layout regression.
+        internal Rectangle CloseRect;
+        internal Rectangle ContentRect;
+
+        class HotZone { public Rectangle R; public Action A; }
+        readonly List<HotZone> Hot = new List<HotZone>();
+
+        public HelpForm(Settings s)
+        {
+            Centered.Alignment = StringAlignment.Center;
+            Centered.LineAlignment = StringAlignment.Center;
+            Text = "problip help";
+            FormBorderStyle = FormBorderStyle.None;
+            StartPosition = FormStartPosition.CenterScreen;
+            ClientSize = new Size(460, 430);
+            BackColor = Palette.BG;
+            DoubleBuffered = true;
+            TopMost = true;
+            ShowInTaskbar = false;
+            try { Icon = AppIcon.For(s.IcoPath, SystemInformation.IconSize.Width); }
+            catch { }
+
+            // One Font created once for the form's whole lifetime (never per
+            // open): repeated open/hide cycles must not allocate fonts.
+            Content = new TextBox();
+            Content.Multiline = true;
+            Content.ReadOnly = true;
+            Content.BorderStyle = BorderStyle.None;
+            Content.ScrollBars = ScrollBars.Vertical;
+            Content.WordWrap = false;
+            Content.Font = F(10);
+            Content.Text = HelpContent.Build();
+            ApplyTheme();                      // colors from the ACTIVE palette
+            Controls.Add(Content);
+            Content.Bounds = new Rectangle(8, 26, ClientSize.Width - 16, ClientSize.Height - 34);
+            ContentRect = Content.Bounds;
+            // The read-only text box is for reading only: it must not become a
+            // focus sink that eats Tab/F1 for the rest of the session.
+            Content.TabStop = false;
+            Content.GotFocus += delegate(object o, EventArgs e)
+            {
+                BeginInvoke(new MethodInvoker(delegate { ActiveControl = null; }));
+            };
+        }
+
+        Font F(int pt)
+        {
+            Font f;
+            if (!Fonts.TryGetValue(pt, out f))
+            {
+                f = ProblipForm.MakePixelFont("Verdana", pt);
+                Fonts[pt] = f;
+            }
+            return f;
+        }
+
+        // Project the CURRENT palette: form background, text control colors,
+        // painted chrome follows on the next paint (OnPaint reads Palette.*).
+        internal void ApplyTheme()
+        {
+            BackColor = Palette.BG;
+            if (Content != null)
+            {
+                Content.BackColor = Palette.BG;
+                Content.ForeColor = Palette.TEXT;
+            }
+            Invalidate();
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                foreach (Font f in Fonts.Values) f.Dispose();
+                Fonts.Clear();
+                Centered.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            if (m.Msg == Native.WM_NCHITTEST)
+            {
+                int raw = unchecked((int)m.LParam.ToInt64());
+                int x = raw & 0xFFFF;
+                int y = (raw >> 16) & 0xFFFF;
+                if (x > 0x7FFF) x -= 0x10000;
+                if (y > 0x7FFF) y -= 0x10000;
+                Point p = PointToClient(new Point(x, y));
+                if (p.Y < 20 && p.X < Width - 20)
+                    m.Result = (IntPtr)Native.HTCAPTION;
+            }
+        }
+
+        void DrawText(Graphics g, string s, int x, int y, Color c, int pt, bool bold = false)
+        {
+            using (var br = new SolidBrush(c))
+                g.DrawString(s, F(pt), br, (float)x, (float)y);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.TextRenderingHint = TextRenderingHint.SingleBitPerPixelGridFit;
+            g.SmoothingMode = SmoothingMode.None;
+            g.InterpolationMode = InterpolationMode.NearestNeighbor;
+            g.CompositingQuality = CompositingQuality.HighSpeed;
+            g.Clear(Palette.BG);
+            Hot.Clear();
+
+            using (var b = new SolidBrush(Palette.SURFACE)) g.FillRectangle(b, 0, 0, Width, 20);
+            DrawText(g, "help", 8, 4, Palette.TEXT, 12, true);
+            var xr = new Rectangle(Width - 20, 0, 20, 20);
+            CloseRect = xr;
+            Hot.Add(new HotZone { R = xr, A = delegate() { Hide(); } });
+            DrawText(g, "X", Width - 16, 4, Palette.TEXT2, 12, true);
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button == MouseButtons.Left)
+            {
+                foreach (HotZone h in Hot)
+                {
+                    if (h.R.Contains(e.Location)) { h.A(); return; }
+                }
+            }
+        }
+    }
+
     static class Program
     {
         static ProblipForm _form;
         static StatsForm _statsForm;
         static ManualIntervalForm _manualForm;
         static ThemesForm _themesForm;
+        static HelpForm _helpForm;
 
         [STAThread]
         static void Main()
@@ -3152,6 +3486,8 @@ namespace Problip
                 menu.Items.Add("Statistics", null, delegate(object o, EventArgs e) { ShowStats(s, engine); });
                 // Same single theme picker as the settings window's THEME line.
                 menu.Items.Add("Themes", null, delegate(object o, EventArgs e) { ShowThemes(s); });
+                // Same single Help window as the title-bar "?" and F1.
+                menu.Items.Add("Help", null, delegate(object o, EventArgs e) { ShowHelp(s); });
                 menu.Items.Add(new ToolStripSeparator());
                 // Preview is stateless: it never flips ON/OFF, never re-arms the
                 // pending wait. A failed preview surfaces through the existing
@@ -3170,6 +3506,7 @@ namespace Problip
                     if (_statsForm != null) { try { _statsForm.Dispose(); } catch { } _statsForm = null; }
                     if (_manualForm != null) { try { _manualForm.Dispose(); } catch { } _manualForm = null; }
                     if (_themesForm != null) { try { _themesForm.Dispose(); } catch { } _themesForm = null; }
+                    if (_helpForm != null) { try { _helpForm.Dispose(); } catch { } _helpForm = null; }
                     tray.Visible = false;
                     Application.Exit();
                 });
@@ -3208,6 +3545,7 @@ namespace Problip
                 if (_statsForm != null) { try { _statsForm.Dispose(); } catch { } _statsForm = null; }
                 if (_manualForm != null) { try { _manualForm.Dispose(); } catch { } _manualForm = null; }
                 if (_themesForm != null) { try { _themesForm.Dispose(); } catch { } _themesForm = null; }
+                if (_helpForm != null) { try { _helpForm.Dispose(); } catch { } _helpForm = null; }
                 if (menu != null) menu.Dispose();
                 if (tray != null)
                 {
@@ -3239,6 +3577,9 @@ namespace Problip
                 _form.OpenManual = delegate() { ShowManual(s, _form); };
                 // The THEME line opens the one reusable theme picker.
                 _form.OpenThemes = delegate() { ShowThemes(s); };
+                // The title-bar "?" (and F1, and the tray Help item) opens the
+                // one reusable Help window.
+                _form.OpenHelp = delegate() { ShowHelp(s); };
                 _form.FormClosing += delegate(object o, FormClosingEventArgs e)
                 {
                     if (e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; _form.Hide(); }
@@ -3291,14 +3632,34 @@ namespace Problip
         }
 
         // Repaints every open/hidden reusable window without recreating any of
-        // them. ManualIntervalForm carries real TextBox children, so its
-        // ApplyTheme also restyles those; the others paint everything.
+        // them. ManualIntervalForm and HelpForm carry real child controls, so
+        // their ApplyTheme also restyles those; the others paint everything.
         internal static void ApplyThemeToWindows()
         {
             if (_form != null && !_form.IsDisposed) _form.ApplyTheme();
             if (_manualForm != null && !_manualForm.IsDisposed) _manualForm.ApplyTheme();
             if (_statsForm != null && !_statsForm.IsDisposed) { _statsForm.BackColor = Palette.BG; _statsForm.Invalidate(); }
             if (_themesForm != null && !_themesForm.IsDisposed) { _themesForm.BackColor = Palette.BG; _themesForm.Invalidate(); }
+            if (_helpForm != null && !_helpForm.IsDisposed) _helpForm.ApplyTheme();
+        }
+
+        // One live Help instance, owned like the statistics view: the title-bar
+        // "?", F1 and the tray Help item all reuse and activate this same form;
+        // user close hides it (never disposes) so theme and state survive.
+        // Opening Help is not a product event: nothing is started/stopped, no
+        // schedule, audio, statistics, glow or persistence is touched.
+        static void ShowHelp(Settings s)
+        {
+            if (_helpForm == null || _helpForm.IsDisposed)
+            {
+                _helpForm = new HelpForm(s);
+                _helpForm.FormClosing += delegate(object o, FormClosingEventArgs e)
+                {
+                    if (e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; _helpForm.Hide(); }
+                };
+            }
+            _helpForm.Show();
+            _helpForm.Activate();
         }
 
         // One live manual-interval editor, owned like the statistics view: a

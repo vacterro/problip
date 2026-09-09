@@ -43,7 +43,15 @@ willpower.
   CodeNomad, Default, Golden Vintage, Vintage Dark, Vintage Classic (the one
   light palette), Dark 2 (OLED), Dracula, Nord and Solarized Dark. Pick one
   from the tray **Themes** menu or the **THEME** line in the settings window;
-  the switch is instant across every open window and is remembered.
+  the switch is instant across every open window and is remembered. Golden
+  Default keeps the historical pre-theme appearance, down to the volume-slider
+  thumb fill.
+- **Help** — one compact help window covering intervals, volume, running and
+  startup, statistics, themes, Blip Glow and troubleshooting. Open it from the
+  **?** button in the settings-window title bar, the tray **Help** item, or by
+  pressing **F1** while the settings window is active. All three open the same
+  window, which follows the selected theme live; opening or closing Help never
+  touches the beeper, the schedule, the statistics or the glow.
 - **Blip Glow** — a soft accent pulse on the main window's background on every
   successful scheduled blip (optional, **on by default**, toggle next to the
   THEME line). TEST/preview blips never glow; a hidden window never animates.
@@ -101,7 +109,14 @@ and toggle ON/OFF.
 - **THEME** — opens the theme picker (same window as the tray **Themes**
   item). Selecting a theme applies it instantly to every open window and
   persists it; if the save fails, the previous theme stays active and one
-  warning reports it.
+  warning reports it. Selected buttons highlight with the theme accent when it
+  is readable on the highlight background, and fall back to the normal text
+  color when it is not (this is what keeps the light Vintage Classic theme's
+  selected controls black-on-silver instead of white-on-silver).
+- **? / F1 / tray Help** — the Help window: a compact, read-only overview
+  (quick start, intervals, volume, running/startup, statistics, themes, glow,
+  troubleshooting and a short FAQ). It follows the theme live and can stay
+  open while you use everything else.
 - **[X] GLOW** — toggles Blip Glow. Turning it off immediately stops any
   running pulse and takes effect on the next scheduled blip; audio and
   timing are never affected.
@@ -209,12 +224,19 @@ reflection, and exits non-zero if any harness fails. Individual harnesses
 - `test_problip_sound.ps1` — missing/corrupt/repaired sound-asset failure state
   and preview truthfulness against a failing asset.
 - `test_problip_repaint.ps1` — GDI/font/repaint regression guard, layout of
-  every row including the THEME/GLOW utility line and the theme picker, and
-  the manual-editor keyboard contract driven through `ProcessDialogKey`.
+  every row including the THEME/GLOW utility line and the theme picker, the
+  manual-editor keyboard contract driven through `ProcessDialogKey`, the
+  title-bar **?** Help affordance geometry and the Help window layout.
 - `test_themes.ps1` — the 15-theme catalog (unique stable ids, complete
-  palettes, donor-value pins, Golden Default pixel pins, normalization of
-  legacy/unknown ids, light-palette readability, OLED black) and theme-switch
+  palettes, donor-value pins, Golden Default pixel pins including the
+  historical `#453D30` volume-thumb ALT, normalization of legacy/unknown ids,
+  light-palette readability, OLED black), the contrast-aware selected-text
+  contract with a bounded all-themes readability audit, and theme-switch
   scheduling immunity.
+- `test_help.ps1` — the Help content contract (required Windows sections,
+  no Android premium/store/trial content), Help's product-state immunity, the
+  one reusable Help window behind all three entry points, theme-live Help
+  projection and Help resource stability.
 - `test_settings.ps1` — settings round-trip, invariant normalization, and
   persistence-failure rollback, including the preview-once volume-commit
   contract.

@@ -543,6 +543,61 @@ try {
     } finally { $gHide.Dispose(); $bmpHide.Dispose() }
     $settings.ShowBlipCounter = $true
 
+    # ---- title-bar "?" Help affordance: measured geometry, no overlaps ----
+    # The painted fields come from the LAST OnPaint above (widest status text
+    # "ERR" included, since this engine has no WAV in its settings dir).
+    $helpR  = [System.Drawing.Rectangle]$formType.GetField('HelpRect',  $nonPublic).GetValue($form)
+    $closeR2 = [System.Drawing.Rectangle]$formType.GetField('CloseRect', $nonPublic).GetValue($form)
+    $statusR = [System.Drawing.Rectangle]$formType.GetField('StatusRect', $nonPublic).GetValue($form)
+    Check 'the "?" Help affordance lies inside the title bar' `
+        ($helpR.Width -gt 0 -and $helpR.Y -ge 0 -and $helpR.Bottom -le 20 -and $helpR.Right -le $clientW) `
+        "help=$helpR clientW=$clientW"
+    Check 'the "?" affordance does not overlap the ON/OFF/ERR status' (-not $helpR.IntersectsWith($statusR)) "help=$helpR status=$statusR"
+    Check 'the "?" affordance does not overlap the X close control' (-not $helpR.IntersectsWith($closeR2)) "help=$helpR close=$closeR2"
+    Check 'the status text does not overlap the X close control' (-not $statusR.IntersectsWith($closeR2)) "status=$statusR close=$closeR2"
+    $mainHot = $formType.GetField('Hot', $nonPublic).GetValue($form)
+    $helpHotMatch = $false
+    foreach ($hz in $mainHot) {
+        $r = [System.Drawing.Rectangle]$hz.GetType().GetField('R').GetValue($hz)
+        if ($r.Equals($helpR)) { $helpHotMatch = $true }
+    }
+    Check 'the "?" hot zone is exactly the painted rectangle (same geometry)' $helpHotMatch
+
+    # ---- HelpForm: compact window, everything inside the client, clear chrome ----
+    $helpType = $asm.GetType('Problip.HelpForm', $true)
+    if ($null -eq $helpType) {
+        Check 'the Help window exists' $false 'Problip.HelpForm missing'
+    } else {
+        $helpCtor = $helpType.GetConstructors($anyCtor)[0]
+        $helpLocal = $helpCtor.Invoke([object[]]@($settings))
+        try {
+            $hPaint = $helpType.GetMethod('OnPaint', $anyMethod)
+            $hSize = $helpType.GetProperty('ClientSize').GetValue($helpLocal)
+            $hW = [int]$hSize.Width; $hH = [int]$hSize.Height
+            $wa = [System.Windows.Forms.SystemInformation]::WorkingArea
+            Check 'the Help window fits inside the usable screen area' ($hW -le $wa.Width -and $hH -le $wa.Height) "help=${hW}x${hH} work=$($wa.Width)x$($wa.Height)"
+            $hbmp = New-Object System.Drawing.Bitmap $hW, $hH
+            try {
+                $hg = [System.Drawing.Graphics]::FromImage($hbmp)
+                try {
+                    $hpe = New-Object System.Windows.Forms.PaintEventArgs $hg, (New-Object System.Drawing.Rectangle 0, 0, $hW, $hH)
+                    try { $hPaint.Invoke($helpLocal, [object[]]@([System.Windows.Forms.PaintEventArgs]$hpe)) } finally { $hpe.Dispose() }
+                } finally { $hg.Dispose() }
+                $hClose = [System.Drawing.Rectangle]$helpType.GetField('CloseRect', $nonPublic).GetValue($helpLocal)
+                $hContent = [System.Drawing.Rectangle]$helpType.GetField('ContentRect', $nonPublic).GetValue($helpLocal)
+                Check 'the Help close control lies inside the Help client' `
+                    ($hClose.X -ge 0 -and $hClose.Y -ge 0 -and $hClose.Right -le $hW -and $hClose.Bottom -le $hH) "close=$hClose client=${hW}x${hH}"
+                Check 'the Help content rectangle lies inside the Help client, below the title' `
+                    ($hContent.X -ge 0 -and $hContent.Y -ge 20 -and $hContent.Right -le $hW -and $hContent.Bottom -le $hH) "content=$hContent"
+                Check 'the Help scrollable content does not overlap the close/title chrome' (-not $hContent.IntersectsWith($hClose)) "content=$hContent close=$hClose"
+                $box = $helpLocal.Controls[0]
+                Check 'the Help content is a read-only borderless multiline text control' `
+                    ([bool]$box.ReadOnly -and [bool]$box.Multiline -and $box.BorderStyle -eq [System.Windows.Forms.BorderStyle]::None)
+                Check 'the Help text control is not a Tab stop (F1/keyboard stay with the main window)' (-not [bool]$box.TabStop)
+            } finally { $hbmp.Dispose() }
+        } finally { try { $helpLocal.Dispose() } catch { } }
+    }
+
     # ---- Blip Glow event contract (A-H) ----
     # Glow fires ONLY from the engine's BlipPlayed (successful SCHEDULED blips).
     # Preview/TEST/failed playback never raise BlipPlayed, so they can never
@@ -605,6 +660,13 @@ try {
     $realClock = [System.Diagnostics.Stopwatch]$glowClockField.GetValue($form)
     $glowClockField.SetValue($form, [System.Diagnostics.Stopwatch]::StartNew())   # fresh clock: elapsed starts near 0
     $onBlipM.Invoke($form, $blipArgs)   # fresh glow on the new clock
+    # Determinism: alpha(0ms) is exactly 0.0, so probing inside the same
+    # millisecond would false-fail the liveness check on a fast path. Wait
+    # until the fresh clock has entered its rise window (elapsed >= 1 ms,
+    # bounded), then alpha is strictly inside (0, 0.25].
+    $freshClock = [System.Diagnostics.Stopwatch]$glowClockField.GetValue($form)
+    $spin = 0
+    while ($freshClock.ElapsedMilliseconds -lt 1 -and $spin -lt 50) { Start-Sleep -Milliseconds 1; $spin++ }
     $alphaBeforeH = [double]$glowAlphaM.Invoke($form, @())
     Check 'the fresh glow is alive before the switch' ($alphaBeforeH -gt 0.0) "before=$alphaBeforeH"
     $paletteTypeH = $asm.GetType('Problip.Palette', $true)
