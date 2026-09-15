@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$Source = (Join-Path (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Definition)) 'Problip.cs')
 )
 
@@ -168,6 +168,9 @@ try {
             $onTextW    = [int]$textWm.Invoke($form, @([System.Drawing.Graphics]$g2, [string]'ON', [int]12))
             $autoOnW    = [int]$textWm.Invoke($form, @([System.Drawing.Graphics]$g2, [string]'[X] autostart', [int]10))
             $autoOffW   = [int]$textWm.Invoke($form, @([System.Drawing.Graphics]$g2, [string]'[ ] autostart', [int]10))
+            # W2-003: the autostart button is sized for its WIDEST state,
+            # including the degraded " !" projection-warning suffix.
+            $autoDegrW  = [int]$textWm.Invoke($form, @([System.Drawing.Graphics]$g2, [string]'[X] autostart !', [int]10))
             $autoR  = [System.Drawing.Rectangle]$formType.GetField('AutoRect',  $nonPublic).GetValue($form)
             $startR = [System.Drawing.Rectangle]$formType.GetField('StartRect', $nonPublic).GetValue($form)
             $stopR  = [System.Drawing.Rectangle]$formType.GetField('StopRect',  $nonPublic).GetValue($form)
@@ -176,7 +179,7 @@ try {
             # The padding contract is LayoutBottomRow's own: every rect is its            # measured label + the layout's 14 px allowance. Assert against            # THAT contract, never a weaker hard-coded number.
             $intendedPadding = 14
             $pairTextW = [Math]::Max($offTextW, $onTextW)
-            $autoTextW = [Math]::Max($autoOnW, $autoOffW)
+            $autoTextW = [Math]::Max([Math]::Max($autoOnW, $autoOffW), $autoDegrW)
             Check 'TEST is wide enough for its measured label plus the layout padding' `
                 ($testR.Width -ge ($testTextW + $intendedPadding)) "w=$($testR.Width) textW=$testTextW padding=$intendedPadding"
             Check 'TEST is fully inside the client width (never clipped)' `
@@ -206,8 +209,9 @@ try {
             $testTextW3  = [int]$textWm.Invoke($form, @([System.Drawing.Graphics]$g3, [string]'TEST', [int]9))
             $pairTextW3  = [Math]::Max([int]$textWm.Invoke($form, @([System.Drawing.Graphics]$g3, [string]'OFF', [int]12)),
                                        [int]$textWm.Invoke($form, @([System.Drawing.Graphics]$g3, [string]'ON', [int]12)))
-            $autoTextW3  = [Math]::Max([int]$textWm.Invoke($form, @([System.Drawing.Graphics]$g3, [string]'[X] autostart', [int]10)),
-                                       [int]$textWm.Invoke($form, @([System.Drawing.Graphics]$g3, [string]'[ ] autostart', [int]10)))
+            $autoTextW3  = [Math]::Max([Math]::Max([int]$textWm.Invoke($form, @([System.Drawing.Graphics]$g3, [string]'[X] autostart', [int]10)),
+                                        [int]$textWm.Invoke($form, @([System.Drawing.Graphics]$g3, [string]'[ ] autostart', [int]10))),
+                                        [int]$textWm.Invoke($form, @([System.Drawing.Graphics]$g3, [string]'[X] autostart !', [int]10)))
             # LayoutBottomRow's own composition: margin + auto + gap + pair +
             # gap + pair + gap + TEST + margin, each rect label + 14 px.
             $need3 = 8 + ($autoTextW3 + 14) + 4 + ($pairTextW3 + 14) + 4 + ($pairTextW3 + 14) + 4 + ($testTextW3 + 14) + 8
@@ -278,6 +282,14 @@ try {
         Check 'the SHOW COUNTER hit zone matches its painted rectangle' $matchCounter
         Check 'the CLOSE hit zone matches its painted rectangle' $matchClose
 
+        # recording state + RESET ALL: the statistics view is self-sufficient
+        $resetR = [System.Drawing.Rectangle]$statsFormType.GetField('ResetRect', $nonPublic).GetValue($statsForm)
+        Check 'the RESET ALL button is fully visible inside the statistics client' `
+            ($resetR.Width -gt 0 -and $resetR.X -ge 0 -and $resetR.Right -le $sW -and $resetR.Bottom -le $sH) `
+            "reset=$resetR client=${sW}x${sH}"
+        Check 'RESET ALL does not overlap CLOSE' (-not $resetR.IntersectsWith($closeR)) "reset=$resetR close=$closeR"
+        Check 'RESET ALL does not overlap the show-counter toggle' (-not $resetR.IntersectsWith($counterR)) "reset=$resetR counter=$counterR"
+
         # Counts have right-aligned space: the widest value fits left of the margin.
         $totalVal = ([long]2147483647).ToString('N0', [System.Globalization.CultureInfo]::CurrentCulture)
         $textWm2 = $statsFormType.GetMethod('TextW', $anyMethod)
@@ -285,6 +297,61 @@ try {
         try {
             $vw = [int]$textWm2.Invoke($statsForm, @([System.Drawing.Graphics]$g4, [string]$totalVal, [int]11))
             Check 'statistics counts have right-aligned space at realistic widths' ($vw -le ($sW - 24)) "valW=$vw client=$sW"
+            # The recording state is a REAL clickable control (not passive text): its
+            # painted rectangle is exposed, lies inside the client, fully fits, does
+            # not overlap the counters/show-counter/RESET ALL/CLOSE, and the exact
+            # same rectangle is the registered hot zone (one source of truth).
+            $recR = [System.Drawing.Rectangle]$statsFormType.GetField('RecordingRect', $nonPublic).GetValue($statsForm)
+            $recW = [int]$textWm2.Invoke($statsForm, @([System.Drawing.Graphics]$g4, [string]'[X] record statistics', [int]10))
+            Check 'the recording control is exposed as a painted rectangle' ($recR.Width -gt 0 -and $recR.Height -gt 0) "rec=$recR"
+            Check 'the recording control lies inside the statistics client' `
+                ($recR.X -ge 0 -and $recR.Y -ge 0 -and $recR.Right -le $sW -and $recR.Bottom -le $sH) `
+                "rec=$recR client=${sW}x${sH}"
+            # Real text measurement: the "[X] record statistics" label must fit the
+            # painted rectangle (width measured on the very Graphics used to paint).
+            Check 'the recording label fully fits its painted rectangle' ($recR.Width -ge ($recW + 14)) "w=$($recR.Width) textW=$recW"
+            $recOverlap = $false
+            foreach ($rr in @($counterR, $closeR, $resetR) + $rowRects) {
+                if ($recR.IntersectsWith($rr)) { $recOverlap = $true }
+            }
+            Check 'the recording control does not overlap counters/show-counter/RESET ALL/CLOSE' (-not $recOverlap) "rec=$recR counter=$counterR reset=$resetR close=$closeR"
+            $matchRec = @($hotRects | Where-Object { $_.X -eq $recR.X -and $_.Y -eq $recR.Y -and $_.Width -eq $recR.Width -and $_.Height -eq $recR.Height }).Count -gt 0
+            Check 'the recording hot zone exactly equals its painted rectangle' $matchRec "rec=$recR"
+
+            # CORE-005 mouse-path exercise: click the REAL registered hot zone
+            # through StatsForm.OnMouseDown and confirm ToggleRecording ran
+            # through the shared preference seam (Settings.StatsEnabled flips,
+            # persisted on disk), then flips back.
+            $statsMouseDown = $statsFormType.GetMethod('OnMouseDown', $anyMethod)
+            $mbLeftS = [System.Windows.Forms.MouseButtons]::Left
+            $statsEnabledField = $settingsType.GetField('StatsEnabled')
+            $recBefore = [bool]$statsEnabledField.GetValue($settings)
+            $clickRec = New-Object System.Windows.Forms.MouseEventArgs $mbLeftS, 1, ([int]($recR.X + $recR.Width / 2)), ([int]($recR.Y + $recR.Height / 2)), 0
+            $statsMouseDown.Invoke($statsForm, [object[]]@([System.Windows.Forms.MouseEventArgs]$clickRec))
+            $recAfter = [bool]$statsEnabledField.GetValue($settings)
+            Check 'clicking the recording hot zone toggles StatsEnabled through the shared seam' ($recAfter -ne $recBefore) "statsEnabled=$recBefore->$recAfter"
+            $statsMouseDown.Invoke($statsForm, [object[]]@([System.Windows.Forms.MouseEventArgs]$clickRec))
+            $recRestored = [bool]$statsEnabledField.GetValue($settings)
+            Check 'a second recording click restores the recording preference' ($recRestored -eq $recBefore) "statsEnabled=$recBefore->$recRestored"
+
+            # RESET ALL mouse-path: the confirmation contract gates the shared
+            # store seam; the form must not duplicate reset logic.
+            $resetConfirmField = $formType.GetField('ResetConfirmation', [Reflection.BindingFlags]'Static,Public,NonPublic')
+            $origResetConfirm = $resetConfirmField.GetValue($null)
+            $totalBeforeReset = [long]$engine.Stats.Snapshot().Total
+            $clickReset = New-Object System.Windows.Forms.MouseEventArgs $mbLeftS, 1, ([int]($resetR.X + $resetR.Width / 2)), ([int]($resetR.Y + $resetR.Height / 2)), 0
+            # Declined confirmation: the destructive command is a true no-op.
+            $resetConfirmField.SetValue($null, [System.Func[bool]]{ param() $false })
+            try {
+                $statsMouseDown.Invoke($statsForm, [object[]]@([System.Windows.Forms.MouseEventArgs]$clickReset))
+                $totalDeclined = [long]$engine.Stats.Snapshot().Total
+                Check 'a declined RESET ALL confirmation leaves every counter unchanged' ($totalDeclined -eq $totalBeforeReset) "total=$totalBeforeReset->$totalDeclined"
+                # Accepted confirmation: the shared atomic reset zeroes the counters.
+                $resetConfirmField.SetValue($null, [System.Func[bool]]{ param() $true })
+                $statsMouseDown.Invoke($statsForm, [object[]]@([System.Windows.Forms.MouseEventArgs]$clickReset))
+                $totalAfterReset = [long]$engine.Stats.Snapshot().Total
+                Check 'clicking RESET ALL with an accepted confirmation zeroes the counters through the shared store seam' ($totalAfterReset -eq 0) "total=$totalBeforeReset->$totalAfterReset"
+            } finally { $resetConfirmField.SetValue($null, $origResetConfirm) }
         } finally { $g4.Dispose() }
     } finally { $sbmp.Dispose() }
 
@@ -352,6 +419,45 @@ try {
     Check 'the THEME row does not overlap the MANUAL/PULSE row' ($themeR.Y -ge $manualR.Bottom) "themeY=$($themeR.Y) modeBottom=$($manualR.Bottom)"
     $failureTextVisibleRoom = $failureY + 14 -le $clientH
     Check 'the failure text remains visible below the utility row' $failureTextVisibleRoom "failureY=$failureY clientH=$clientH"
+
+    # ---- CORE-002: the THEME hit zone is a real clickable rectangle ----
+    # ThemeRect once had width 0: it advertised THEME/open-themes and could
+    # never receive a click. These checks pin the geometry AND then exercise
+    # the REAL registered mouse path at representative coordinates.
+    Check 'ThemeRect is a nonzero interaction rectangle' ($themeR.Width -gt 0 -and $themeR.Height -gt 0) "theme=$themeR"
+    $clientRectR = New-Object System.Drawing.Rectangle 0, 0, $clientW, $clientH
+    Check 'ThemeRect lies inside the ClientRectangle' ($clientRectR.Contains($themeR)) "theme=$themeR client=${clientW}x${clientH}"
+    Check 'ThemeRect does not intersect GlowRect' (-not $themeR.IntersectsWith($glowR)) "theme=$themeR glow=$glowR"
+    Check 'ThemeRect covers the visible THEME label + theme-name region' ($themeR.Contains($nameR)) "theme=$themeR name=$nameR"
+    {
+        # Mouse-path exercise: replace OpenThemes with a counter, drive the
+        # registered HotZone through the form's real OnMouseDown, then put the
+        # original delegate back. A second click inside GLOW must invoke only
+        # ToggleGlow (the recording preference flips, the theme count does not).
+        $openThemesField = $formType.GetField('OpenThemes', [Reflection.BindingFlags]'Instance,Public')
+        $origOpenThemes = $openThemesField.GetValue($form)
+        $themeClicks = 0
+        $form.OpenThemes = [Action]{ $script:themeClicks++ }
+        try {
+            $onMouseDownM = $formType.GetMethod('OnMouseDown', $anyMethod)
+            $mbLeft = [System.Windows.Forms.MouseButtons]::Left
+            $clickThemeLabel   = New-Object System.Windows.Forms.MouseEventArgs $mbLeft, 1, ($themeR.X + 10), ($themeR.Y + 10), 0
+            $clickThemeNameMid = New-Object System.Windows.Forms.MouseEventArgs $mbLeft, 1, ([int]($nameR.X + $nameR.Width / 2)), ([int]($nameR.Y + $nameR.Height / 2)), 0
+            $clickThemeNameEnd = New-Object System.Windows.Forms.MouseEventArgs $mbLeft, 1, ($nameR.Right - 4), ($nameR.Y + 4), 0
+            $onMouseDownM.Invoke($form, [object[]]@([System.Windows.Forms.MouseEventArgs]$clickThemeLabel))
+            $onMouseDownM.Invoke($form, [object[]]@([System.Windows.Forms.MouseEventArgs]$clickThemeNameMid))
+            $onMouseDownM.Invoke($form, [object[]]@([System.Windows.Forms.MouseEventArgs]$clickThemeNameEnd))
+            Check 'clicks on THEME label and theme name invoke OpenThemes exactly once each' ($script:themeClicks -eq 3) "clicks=$($script:themeClicks)"
+            $glowBefore = [bool]$settingsType.GetField('BlipGlow').GetValue($settings)
+            $clickGlow = New-Object System.Windows.Forms.MouseEventArgs $mbLeft, 1, ($glowR.X + ($glowR.Width / 2)), ($glowR.Y + ($glowR.Height / 2)), 0
+            $onMouseDownM.Invoke($form, [object[]]@([System.Windows.Forms.MouseEventArgs]$clickGlow))
+            $glowAfter = [bool]$settingsType.GetField('BlipGlow').GetValue($settings)
+            Check 'clicking GlowRect invokes only GLOW (theme count unchanged, glow toggled)' `
+                ($script:themeClicks -eq 3 -and $glowAfter -ne $glowBefore) "clicks=$($script:themeClicks) glow=$glowBefore->$glowAfter"
+            $glowPrefField = $settingsType.GetField('BlipGlow')
+            $glowPrefField.SetValue($settings, $glowBefore)
+        } finally { $openThemesField.SetValue($form, $origOpenThemes) }
+    }
 
     # ---- ThemesForm: 15 rows fit, swatches/labels clear, hit zones match ----
     $themesType = $asm.GetType('Problip.ThemesForm', $true)
@@ -528,10 +634,10 @@ try {
 
     # ---- hiding the counter: BLIPS rect empty, controls still fit ----
     $settings.ShowBlipCounter = $false
-    $bmpHide = New-Object System.Drawing.Bitmap 280, 168
+    $bmpHide = New-Object System.Drawing.Bitmap 280, 240
     $gHide = [System.Drawing.Graphics]::FromImage($bmpHide)
     try {
-        $peHide = New-Object System.Windows.Forms.PaintEventArgs $gHide, (New-Object System.Drawing.Rectangle 0, 0, 280, 168)
+        $peHide = New-Object System.Windows.Forms.PaintEventArgs $gHide, (New-Object System.Drawing.Rectangle 0, 0, 280, 240)
         try { $onPaint.Invoke($form, [object[]]@([System.Windows.Forms.PaintEventArgs]$peHide)) } finally { $peHide.Dispose() }
         $blipsHidden = [System.Drawing.Rectangle]$formType.GetField('BlipsRect', $nonPublic).GetValue($form)
         $autoHidden = [System.Drawing.Rectangle]$formType.GetField('AutoRect', $nonPublic).GetValue($form)
@@ -562,6 +668,33 @@ try {
         if ($r.Equals($helpR)) { $helpHotMatch = $true }
     }
     Check 'the "?" hot zone is exactly the painted rectangle (same geometry)' $helpHotMatch
+
+    # ---- main-window PREFS entry row: measured, below the bottom row, clear ----
+    $prefsRowField = $formType.GetField('PrefsRowY', $staticAll)
+    if ($null -eq $prefsRowField) {
+        Check 'the main window exposes one PREFS entry row' $false 'PrefsRowY missing'
+    } else {
+        $prefsRowY = [int]$prefsRowField.GetValue($null)
+        $prefsR = [System.Drawing.Rectangle]$formType.GetField('PrefsRect', $nonPublic).GetValue($form)
+        Check 'the PREFS entry row sits below the bottom row' ($prefsRowY -ge $bottomY + 22) "prefsY=$prefsRowY bottomY=$bottomY"
+        Check 'the PREFS button is painted inside the ClientRectangle' `
+            ($prefsR.Width -gt 0 -and $prefsR.X -ge 0 -and $prefsR.Right -le $clientW -and $prefsR.Bottom -le $clientH) `
+            "prefs=$prefsR client=${clientW}x${clientH}"
+        $gPF = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero)
+        try {
+            $prefsLabelW = [int]$textWm.Invoke($form, @([System.Drawing.Graphics]$gPF, [string]'PREFS', [int]9))
+            Check 'the PREFS button fits its full label' ($prefsR.Width -ge ($prefsLabelW + 14)) "w=$($prefsR.Width) textW=$prefsLabelW"
+        } finally { $gPF.Dispose() }
+        Check 'the PREFS button does not overlap the bottom row' (-not $prefsR.IntersectsWith($autoR) -and -not $prefsR.IntersectsWith($testR)) `
+            "prefs=$prefsR auto=$autoR"
+        $mainHot2 = $formType.GetField('Hot', $nonPublic).GetValue($form)
+        $prefsHotMatch = $false
+        foreach ($hz in $mainHot2) {
+            $r = [System.Drawing.Rectangle]$hz.GetType().GetField('R').GetValue($hz)
+            if ($r.Equals($prefsR)) { $prefsHotMatch = $true }
+        }
+        Check 'the PREFS hot zone is exactly the painted rectangle (same geometry)' $prefsHotMatch
+    }
 
     # ---- HelpForm: compact window, everything inside the client, clear chrome ----
     $helpType = $asm.GetType('Problip.HelpForm', $true)
@@ -596,6 +729,69 @@ try {
                 Check 'the Help text control is not a Tab stop (F1/keyboard stay with the main window)' (-not [bool]$box.TabStop)
             } finally { $hbmp.Dispose() }
         } finally { try { $helpLocal.Dispose() } catch { } }
+    }
+
+    # ---- PreferencesForm: every section inside the client, no overlaps ----
+    $prefsType = $asm.GetType('Problip.PreferencesForm', $true)
+    if ($null -eq $prefsType) {
+        Check 'the preferences window exists' $false 'Problip.PreferencesForm missing'
+    } else {
+        $prefsCtor = $prefsType.GetConstructors($anyCtor)[0]
+        $prefs = $prefsCtor.Invoke([object[]]@($settings, $engine))
+        try {
+            $pPaint = $prefsType.GetMethod('OnPaint', $anyMethod)
+            $pSize = $prefsType.GetProperty('ClientSize').GetValue($prefs)
+            $pW = [int]$pSize.Width; $pH = [int]$pSize.Height
+            $wa2 = [System.Windows.Forms.SystemInformation]::WorkingArea
+            Check 'the Preferences window fits inside the usable screen area' ($pW -le $wa2.Width -and $pH -le $wa2.Height) "prefs=${pW}x${pH} work=$($wa2.Width)x$($wa2.Height)"
+            $pbmp = New-Object System.Drawing.Bitmap $pW, $pH
+            try {
+                $pg = [System.Drawing.Graphics]::FromImage($pbmp)
+                try {
+                    $ppe = New-Object System.Windows.Forms.PaintEventArgs $pg, (New-Object System.Drawing.Rectangle 0, 0, $pW, $pH)
+                    try { $pPaint.Invoke($prefs, [object[]]@([System.Windows.Forms.PaintEventArgs]$ppe)) } finally { $ppe.Dispose() }
+                } finally { $pg.Dispose() }
+
+                $prefRectNames = @('OnRect','OffRect','AutoStartRect','PreviewRect','TestRect',
+                    'StatsEnabledRect','ShowCounterRect','ViewRect','ResetAllRect',
+                    'GlowRect','TopRect','ThemeNameRect','ChangeRect')
+                $prefRects = @{}
+                $pAllIn = $true; $pDetail = ''
+                foreach ($n in $prefRectNames) {
+                    $r = [System.Drawing.Rectangle]$prefsType.GetField($n, $nonPublic).GetValue($prefs)
+                    $prefRects[$n] = $r
+                    if ($r.X -lt 0 -or $r.Y -lt 20 -or $r.Right -gt $pW -or $r.Bottom -gt $pH) { $pAllIn = $false; $pDetail += "$n=$r " }
+                }
+                Check 'every Preferences section is inside the ClientRectangle' $pAllIn "client=${pW}x${pH} $pDetail"
+                $pHeaderOverlap = $false
+                foreach ($n in $prefRectNames) {
+                    if ($prefRects[$n].Y -lt 20) { $pHeaderOverlap = $true }
+                }
+                Check 'no Preferences control overlaps the header' (-not $pHeaderOverlap)
+                $pReset = $prefRects['ResetAllRect']
+                Check 'RESET ALL is fully visible in the Preferences window' `
+                    ($pReset.Width -gt 0 -and $pReset.Right -le $pW -and $pReset.Bottom -le $pH) "reset=$pReset"
+                $pClose = [System.Drawing.Rectangle]$prefsType.GetField('CloseRect', $nonPublic).GetValue($prefs)
+                Check 'the Preferences title-bar X is visible at the top right' `
+                    ($pClose.Width -eq 20 -and $pClose.Bottom -eq 20 -and $pClose.Right -eq $pW) "close=$pClose"
+                # current theme name truncates safely within its allotted rect
+                $nameRect = $prefRects['ThemeNameRect']
+                Check 'the Preferences theme-name rectangle is measurable' ($nameRect.Width -gt 0) "name=$nameRect"
+                # hit zones equal painted geometry: every registered hot zone rect
+                # matches one of the exposed section rects. ThemeNameRect is a
+                # plain label (no click target), so it is excluded here.
+                $pHot = $prefsType.GetField('Hot', $nonPublic).GetValue($prefs)
+                $pHotRects = @()
+                foreach ($hz in $pHot) { $pHotRects += ,([System.Drawing.Rectangle]$hz.GetType().GetField('R').GetValue($hz)) }
+                $zonesMatched = $true; $zoneDetail = ''
+                foreach ($n in ($prefRectNames | Where-Object { $_ -ne 'ThemeNameRect' })) {
+                    $r = $prefRects[$n]
+                    $found = @($pHotRects | Where-Object { $_.Equals($r) }).Count
+                    if ($found -lt 1) { $zonesMatched = $false; $zoneDetail += "$n=$r " }
+                }
+                Check 'every Preferences toggle/button hit zone equals its painted geometry' $zonesMatched $zoneDetail
+            } finally { $pbmp.Dispose() }
+        } finally { try { $prefs.Dispose() } catch { } }
     }
 
     # ---- Blip Glow event contract (A-H) ----
@@ -717,12 +913,19 @@ try {
 }
 
 # Source contracts the audit clause names explicitly.
-$text = Get-Content -LiteralPath $Source -Raw
+$text = Get-Content -LiteralPath $Source -Raw -Encoding UTF8
 $dragBody = [Regex]::Match($text, 'void SetVolumeFromX\(int x\)\s*\{(?<body>[^}]*)\}')
 Check 'the drag path coalesces repaints instead of forcing them' `
     ($dragBody.Success -and $dragBody.Groups['body'].Value -match 'Invalidate\(\)' -and $dragBody.Groups['body'].Value -notmatch 'Refresh\(\)')
 Check 'DrawButton no longer builds a StringFormat per call' ($text -notmatch 'var fmt = new StringFormat\(\)')
 Check 'the T-88 HFONT release stays in place' ($text -match 'Font\.FromHfont' -and $text -match 'Native\.DeleteObject')
+# Mojibake regression: the known double-encoded sequences (UTF-8 bytes
+# misread as CP-1252: "вЂ”" em dash, "вЂ¦" ellipsis, "в”Ђ" box rules) must
+# never re-enter Problip.cs. Get-Content -Raw reads with encoding
+# detection; matching the literal mojibake text proves the file carries
+# the intended Unicode characters instead.
+Check 'no mojibake sequences remain in Problip.cs' `
+    ($text -notmatch 'вЂ|в”|РІ' -and $text -match '—' -and $text -match '…')
 
 Write-Host '---'
 if ($failures) { Write-Host "FAILED ($failures failure(s))"; exit 1 }

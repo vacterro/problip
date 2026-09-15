@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -298,6 +298,19 @@ namespace Problip
         // the active accent. Absent/malformed INI value keeps the product default
         // (ON) -- only an exact "0" turns it off.
         public bool BlipGlow = true;
+        // Whether successful scheduled blips are recorded to statistics.
+        // Absent/malformed INI value keeps the product default (ON) -- only an
+        // exact "0" pauses recording. Pausing keeps history, audio, glow and
+        // the counter display untouched.
+        public bool StatsEnabled = true;
+        // Whether a successful volume change plays one preview blip. Absent or
+        // malformed INI value keeps the product default (ON) -- only an exact
+        // "0" skips it. TEST is independent and always plays.
+        public bool PreviewOnVolumeChange = true;
+        // Whether every PROBLIP window stays above other windows. Absent or
+        // malformed INI value keeps the product default (ON) -- only an exact
+        // "0" lets windows sink behind others.
+        public bool AlwaysOnTop = true;
 
         public Settings(string dir)
         {
@@ -314,8 +327,13 @@ namespace Problip
 
         string Read(string key, string def)
         {
+            return ReadFrom(IniPath, key, def);
+        }
+
+        static string ReadFrom(string path, string key, string def)
+        {
             var sb = new System.Text.StringBuilder(260);
-            GetPrivateProfileString("problip", key, def, sb, sb.Capacity, IniPath);
+            GetPrivateProfileString("problip", key, def, sb, sb.Capacity, path);
             return sb.ToString();
         }
         // Best-effort persistence: returns false instead of swallowing the Win32
@@ -382,6 +400,12 @@ namespace Problip
             // Glow: default ON; only an exact "0" means off (same tolerance as
             // RunOnLaunch/ShowBlipCounter).
             BlipGlow = Read("BlipGlow", "1") != "0";
+            // Recording: default ON; only an exact "0" pauses counting.
+            StatsEnabled = Read("StatsEnabled", "1") != "0";
+            // Volume preview: default ON; only an exact "0" skips it.
+            PreviewOnVolumeChange = Read("PreviewOnVolumeChange", "1") != "0";
+            // Always-on-top: default ON; only an exact "0" turns it off.
+            AlwaysOnTop = Read("AlwaysOnTop", "1") != "0";
             if (!File.Exists(IniPath))
             {
                 // Fresh-install: best-effort defaults. A read-only location simply
@@ -404,6 +428,11 @@ namespace Problip
                 // Fresh-install appearance defaults: Golden Default, glow on.
                 TryWrite("ThemeId", ThemeModel.Classic.Id);
                 TryWrite("BlipGlow", "1");
+                // Fresh-install preference defaults: recording, volume preview
+                // and always-on-top are all on.
+                TryWrite("StatsEnabled", "1");
+                TryWrite("PreviewOnVolumeChange", "1");
+                TryWrite("AlwaysOnTop", "1");
             }
         }
 
@@ -417,29 +446,66 @@ namespace Problip
                 throw new System.IO.IOException("failed to persist setting '" + key + "' to " + IniPath);
         }
 
-        // One interval transaction: write every key in order; on the first
-        // failure, best-effort restore the keys already written from the
-        // previous values (same key order) and return false. The caller applies
-        // nothing until this returns true, so the session never displays a mode
-        // the INI rejected. Small and dedicated on purpose -- no generic
-        // transaction framework.
+        // Failure-atomic interval transaction. The rollback-based version could
+        // leave a HYBRID problem on disk when a key write AND its compensating
+        // write both failed (e.g. MinMs new + MaxMs old), which the next launch
+        // projects as real scheduling. The commit unit is now a sibling candidate
+        // copy of the INI: every key change lands in the candidate first, the
+        // candidate is verified, and the real INI is atomically replaced/moved
+        // only after the whole section succeeded. Any failure leaves the original
+        // byte-for-byte intact; the temp is removed best-effort.
+        internal Func<string, string, string, bool> IntervalWrite = DefaultIntervalWrite;
+        internal Func<string, string, bool> CommitIntervalFile = DefaultCommitIntervalFile;
+
+        // Win32 profile write against an ARBITRARY ini path (the real INI or the
+        // transaction candidate). Returns the verified Win32 result.
+        static bool DefaultIntervalWrite(string iniPath, string key, string val)
+        {
+            try { return WritePrivateProfileString("problip", key, val, iniPath); }
+            catch { return false; }
+        }
+
+        // Same-directory atomic replacement for the interval commit: File.Replace
+        // when the target exists, File.Move when it does not (fresh INI).
+        static bool DefaultCommitIntervalFile(string tempPath, string targetPath)
+        {
+            try
+            {
+                if (System.IO.File.Exists(targetPath))
+                    System.IO.File.Replace(tempPath, targetPath, null);
+                else
+                    System.IO.File.Move(tempPath, targetPath);
+                return true;
+            }
+            catch { return false; }
+        }
+
         public bool SaveIntervalState(System.Collections.Generic.KeyValuePair<string, string>[] next,
                                       System.Collections.Generic.KeyValuePair<string, string>[] previous)
         {
-            for (int i = 0; i < next.Length; i++)
+            string temp = IniPath + ".interval.tmp";
+            try
             {
-                try { Save(next[i].Key, next[i].Value); }
-                catch (System.IO.IOException)
+                if (System.IO.File.Exists(IniPath))
+                    System.IO.File.Copy(IniPath, temp, true);
+                // Apply every requested key change to the candidate only. The
+                // production write is verified; a claimed-success-without-write
+                // is caught by the readback below.
+                for (int i = 0; i < next.Length; i++)
                 {
-                    for (int j = 0; j < i; j++)
-                    {
-                        try { Save(previous[j].Key, previous[j].Value); }
-                        catch (System.IO.IOException) { }
-                    }
-                    return false;
+                    if (!IntervalWrite(temp, next[i].Key, next[i].Value)) return false;
+                    if (ReadFrom(temp, next[i].Key, null) != next[i].Value) return false;
                 }
+                return CommitIntervalFile(temp, IniPath);
             }
-            return true;
+            catch
+            {
+                return false;
+            }
+            finally
+            {
+                try { if (System.IO.File.Exists(temp)) System.IO.File.Delete(temp); } catch { }
+            }
         }
     }
 
@@ -731,6 +797,59 @@ namespace Problip
             week = 1 + (thursday.DayOfYear - 1) / 7;
         }
 
+        public static long AddSaturating(long a, long b)
+        {
+            long sa = a < 0 ? 0 : a;
+            long sb = b < 0 ? 0 : b;
+            if (sa == long.MaxValue || sb == long.MaxValue) return long.MaxValue;
+            if (sa > long.MaxValue - sb) return long.MaxValue;
+            return sa + sb;
+        }
+
+        // THE snapshot-copy primitive for BlipStatsRecord. Every persistence
+        // path that carries a record across the StateLock boundary (pending
+        // worker snapshot, synchronous lifecycle flush, recovery commit)
+        // serializes THIS immutable captured copy -- never the live Record
+        // object, which concurrent RecordBlip() calls mutate under StateLock.
+        // All seven persisted fields are copied.
+        public static BlipStatsRecord CopyRecord(BlipStatsRecord r)
+        {
+            BlipStatsRecord c = new BlipStatsRecord();
+            if (r == null) return c;
+            c.DayKey = r.DayKey; c.TodayCount = r.TodayCount;
+            c.WeekKey = r.WeekKey; c.WeekCount = r.WeekCount;
+            c.MonthKey = r.MonthKey; c.MonthCount = r.MonthCount;
+            c.TotalCount = r.TotalCount;
+            return c;
+        }
+
+        public static BlipStatsRecord MergeBaselineAndDelta(BlipStatsRecord baseline, BlipStatsRecord delta, DateTime now)
+        {
+            BlipStatsRecord m = new BlipStatsRecord();
+            long totalDelta = delta == null ? 0 : delta.TotalCount;
+            m.TotalCount = AddSaturating(baseline == null ? 0 : baseline.TotalCount, totalDelta);
+            m.DayKey = DayKey(now);
+            m.WeekKey = WeekKey(now);
+            m.MonthKey = MonthKey(now);
+            long bd = 0, wd = 0, md = 0;
+            if (delta != null)
+            {
+                if (delta.DayKey == m.DayKey) bd = delta.TodayCount;
+                if (delta.WeekKey == m.WeekKey) wd = delta.WeekCount;
+                if (delta.MonthKey == m.MonthKey) md = delta.MonthCount;
+            }
+            long bt = baseline == null ? 0 : baseline.TodayCount;
+            long bw = baseline == null ? 0 : baseline.WeekCount;
+            long bm = baseline == null ? 0 : baseline.MonthCount;
+            string bDay = baseline == null ? null : baseline.DayKey;
+            string bWeek = baseline == null ? null : baseline.WeekKey;
+            string bMonth = baseline == null ? null : baseline.MonthKey;
+            m.TodayCount = bDay == m.DayKey ? AddSaturating(bt, bd) : bd;
+            m.WeekCount = bWeek == m.WeekKey ? AddSaturating(bw, wd) : wd;
+            m.MonthCount = bMonth == m.MonthKey ? AddSaturating(bm, md) : md;
+            return m;
+        }
+
         // Displays stored state for the CURRENT instant without mutating it:
         // stale periods read 0 even before the first blip of the new period
         // (lazy rollover, no midnight timer), Total never resets.
@@ -773,9 +892,29 @@ namespace Problip
     // only after the temporary write fully succeeds: a reader can only ever
     // see one COMPLETE snapshot, never a hybrid. A tiny managed parser reads
     // the section back; no Win32 profile call touches this file anymore.
+    enum StatsBaselineState
+    {
+        Missing,
+        Healthy,
+        Unreadable
+    }
+
     class BlipStatsStore
     {
         public const long FlushIntervalMs = 10000;
+
+        // PERF-001: statistics filesystem persistence is OFF the WinForms
+        // scheduled-audio hot path. RecordBlip only mutates memory and, when the
+        // batching window has elapsed, publishes at most one latest pending
+        // snapshot (or one latest recovery request while the baseline is
+        // unreadable) to ONE serialized background worker. Ordinary scheduled
+        // ticks never wait for a disk commit and never run recovery I/O.
+
+        // -- Shared mutable statistics state (guarded by StateLock) --
+        // The in-memory authoritative record, the unreadable-baseline session
+        // delta, the dirty flag and the batch/attempt bookkeeping. The lock is
+        // NEVER held while filesystem I/O runs.
+        readonly object StateLock = new object();
 
         public string Path;
         public BlipStatsRecord Record = new BlipStatsRecord();
@@ -787,28 +926,126 @@ namespace Problip
         internal Func<long> NowMs;
         // The last SUCCESSFUL flush: clears the batching window.
         long LastFlushMs;
-        // The last flush ATTEMPT, successful or not. The old contract advanced
-        // the window only on success, so a permanently unwritable stats path
-        // retried a synchronous disk operation on EVERY blip -- at a 1-second
-        // MANUAL interval that is one failed disk hit per second inside the
-        // scheduled path. Attempt time now advances on failure too, bounding
-        // retries to the batching interval regardless of outcome.
+        // The last flush ATTEMPT, successful or not. The window advances when an
+        // attempt is scheduled/accepted (not only after completion), so a
+        // permanently failing path cannot turn every blip into a disk retry.
         long LastFlushAttemptMs;
         public bool Dirty;
-        // Test instrumentation only: one per actual persistent snapshot commit
-        // attempt (never per key -- the commit is one operation now).
+        // Test instrumentation only: one per actual persistent commit attempt
+        // (worker snapshot, lifecycle flush or recovery commit) -- never per key.
         internal int FlushAttemptCount;
+
+        internal StatsBaselineState BaselineState;
+        internal BlipStatsRecord PendingDelta = new BlipStatsRecord();
+        internal Func<string, string> ReadText = DefaultReadText;
+
+        // -- PERF-001 generation/ordering model --
+        // Every publication (or synchronous commit/reset/recovery) captures and
+        // advances PublishGen. Every physical commit carries the generation it
+        // captured. A completion may only clear Dirty when its generation is
+        // still the newest published one AND no statistic mutation happened
+        // after its snapshot was captured (DataVersion match). A stale
+        // completion is dropped: it can never overwrite a newer logical state,
+        // resurrect pre-reset counters, or clear Dirty for unpersisted state.
+        // The same generation eligibility is re-validated immediately BEFORE
+        // every physical write (worker snapshot, synchronous flush, recovery
+        // commit): a stale generation never reaches the disk at all -- the old
+        // post-write check alone protected bookkeeping, not disk ordering.
+        long PublishGen;
+        // DataVersion increments on every RecordBlip/recovery/reset mutation of
+        // the in-memory statistics content.
+        long DataVersion;
+        // The generation of the snapshot currently being persisted by the
+        // worker, or 0 when idle.
+        long InFlightGen;
+
+        // -- The serialized physical-commit gate --
+        // Exactly one thread may run File.Replace/File.Move or a recovery
+        // commit at a time. TryResetAll uses the SAME gate (with the documented
+        // bounded wait) so a pre-reset in-flight commit can never land after
+        // the reset's zero snapshot; a reset that cannot acquire the gate in
+        // time returns false and queues nothing.
+        readonly object CommitGate = new object();
+        internal const int CommitGateTimeoutMs = 2000;
+
+        // -- Worker: exactly ONE background thread per store, created lazily on
+        // the first eligible publication. It holds at most one in-flight commit
+        // and at most one latest pending snapshot/recovery request (a newer
+        // pending state replaces an older one -- never one work item per blip,
+        // never an unbounded queue, never a new Task/thread per blip).
+        System.Threading.Thread Worker;
+        readonly object WorkerLock = new object();
+        // The latest unpublished pending snapshot, or null. Guarded by
+        // WorkerLock; writing a new one replaces an older pending one.
+        PendingCommit Pending;
+        // At most one latest pending recovery request while the baseline is
+        // unreadable. Guarded by WorkerLock; re-requesting is idempotent.
+        bool PendingRecovery;
+        bool Disposed;
+
+        class PendingCommit
+        {
+            public BlipStatsRecord Snapshot;   // immutable captured state
+            public long Gen;                   // PublishGen at capture
+            public long DataVer;               // DataVersion at capture
+        }
+
+        // Test seams (internal, never production UI): deterministic observation
+        // of the worker without sleeps.
+        internal Action CommitStarted;       // worker begins one physical commit
+        internal Action CommitCompleted;     // worker finished one (success or fail)
+        internal Action RecoveryAttempted;   // a recovery attempt begins
+        internal Func<bool> CommitFileGate;  // test block/fail point inside the commit
+        // Test-only deterministic pause points (compiled IL delegates; null in
+        // production). PreGatePause stops the worker BEFORE it takes the commit
+        // gate; FlushCapturePause stops a synchronous flush AFTER its snapshot
+        // capture and BEFORE the gate. Together they make the stale-generation
+        // and immutable-snapshot orderings reproducible without sleeps.
+        internal Func<bool> PreGatePause;
+        internal Func<bool> FlushCapturePause;
+        internal Func<bool> RecoveryCapturePause;   // test block point after recovery capture, before WriteCommitFile
+        internal int StaleSkipCount;         // pre-write stale-generation skips
+        internal int CommitStartedCount;
+        internal int CommitCompletedCount;
+        internal int RecoveryAttemptCount;
+        internal long CommittedGen;
+        // Signalled whenever the worker finishes a commit or recovery attempt.
+        readonly System.Threading.AutoResetEvent IdleSignal = new System.Threading.AutoResetEvent(false);
+
+        internal long LatestRequestedGen
+        {
+            get { lock (StateLock) { return PublishGen; } }
+        }
+        internal bool WorkerBusy
+        {
+            get { lock (StateLock) { return InFlightGen != 0; } }
+        }
+        internal bool HasPendingSnapshot
+        {
+            get { lock (WorkerLock) { return Pending != null; } }
+        }
+        internal bool HasPendingRecovery
+        {
+            get { lock (WorkerLock) { return PendingRecovery; } }
+        }
+
+        public bool HasKnownBaseline { get { return BaselineState != StatsBaselineState.Unreadable; } }
+
+        static string DefaultReadText(string target)
+        {
+            if (!System.IO.File.Exists(target)) return null;
+            return System.IO.File.ReadAllText(target);
+        }
 
         // Commit seam for the atomic regression: production replaces the
         // temporary file over the target. A test can force the replacement
         // step to fail before the committed file is touched.
         internal Func<string, string, bool> CommitFile = DefaultCommitFile;
 
-        // Same-directory atomic replacement. WritePrivateProfileString has no
-        // transactional equivalent, so the commit is File.Replace when the
-        // target already exists (same-volume atomic swap, keeps no backup) and
-        // File.Move when it does not. A Move/Replace failure leaves the
-        // committed file untouched.
+        // Same-directory atomic replacement. The whole [stats] section is one
+        // atomic unit: File.Replace when the target already exists (same-volume
+        // atomic swap, keeps no backup) and File.Move when it does not. A
+        // Move/Replace failure leaves the committed file untouched.
         static bool DefaultCommitFile(string tempPath, string targetPath)
         {
             try
@@ -823,55 +1060,458 @@ namespace Problip
         }
 
         public BlipStatsStore(string dir)
+            : this(dir, DefaultReadText)
+        {
+        }
+
+        internal BlipStatsStore(string dir, Func<string, string> readText)
         {
             Path = System.IO.Path.Combine(dir, "problip.stats.ini");
             NowMs = () => Clock.ElapsedMilliseconds;
+            ReadText = readText ?? DefaultReadText;
             Load();
         }
 
         public BlipStatsSnapshot Snapshot()
         {
-            return BlipStatsLogic.Snapshot(Record, LocalNow());
+            lock (StateLock)
+            {
+                return BlipStatsLogic.Snapshot(Record, LocalNow());
+            }
         }
 
-        // One successful scheduled blip: update memory, mark dirty, and attempt
-        // a flush at most once per FlushIntervalMs -- counted from the last
-        // ATTEMPT, so a failing stats path cannot turn every blip into a
-        // synchronous disk failure. A flush failure is swallowed here on
-        // purpose -- statistics are secondary and must never surface into the
-        // audio path.
+        // One successful scheduled blip: update memory, mark dirty, and publish
+        // at most one latest pending snapshot to the background worker when the
+        // batching window has elapsed -- counted from the last ATTEMPT, so a
+        // failing stats path cannot turn every blip into a disk retry. This
+        // method NEVER touches the filesystem and NEVER waits for persistence:
+        // a slow or blocked commit delays nothing on the scheduled-audio path.
+        // While the baseline is unreadable the blip lands in the session delta
+        // and the worker receives a RECOVERY request instead of a snapshot: no
+        // scheduled path ever reads (or writes) the unknown file.
         public void RecordBlip()
         {
-            BlipStatsLogic.Record(Record, LocalNow());
-            Dirty = true;
-            if (NowMs() - LastFlushAttemptMs >= FlushIntervalMs) Flush();
+            DateTime now = LocalNow();
+            bool publish = false, recover = false;
+            lock (StateLock)
+            {
+                if (BaselineState == StatsBaselineState.Unreadable)
+                    BlipStatsLogic.Record(PendingDelta, now);
+                else
+                    BlipStatsLogic.Record(Record, now);
+                Dirty = true;
+                DataVersion++;
+                if (NowMs() - LastFlushAttemptMs >= FlushIntervalMs)
+                {
+                    // The attempt window advances when the asynchronous attempt
+                    // is SCHEDULED, not only after completion: a permanently
+                    // failing or blocked path must not retry per blip.
+                    LastFlushAttemptMs = NowMs();
+                    FlushAttemptCount++;
+                    if (BaselineState == StatsBaselineState.Unreadable) recover = true;
+                    else publish = true;
+                }
+            }
+            if (publish) PublishSnapshot();
+            else if (recover) RequestRecovery();
         }
 
-        // Best-effort write of the newest in-memory snapshot. Returns whether it
-        // landed; never throws. On success the dirty flag clears and the
-        // batching window resets; on failure the committed file stays on the
-        // previous COMPLETE snapshot, the temp file is removed best-effort,
-        // Dirty stays set and the attempt window still advances (bounded retry).
-        public bool Flush()
+        // -- Worker plumbing --
+
+        // Capture one immutable snapshot of the newest state and hand it to the
+        // single serialized worker. The pending slot holds at most the latest
+        // snapshot; an older pending capture is simply replaced.
+        void PublishSnapshot()
         {
-            FlushAttemptCount++;
-            LastFlushAttemptMs = NowMs();
+            PendingCommit pc;
+            lock (StateLock)
+            {
+                BlipStatsRecord snap = Record;
+                pc = new PendingCommit();
+                pc.Snapshot = BlipStatsLogic.CopyRecord(snap);   // one shared immutable-copy primitive
+                pc.Gen = ++PublishGen;
+                pc.DataVer = DataVersion;
+            }
+            lock (WorkerLock)
+            {
+                if (Disposed) return;
+                Pending = pc;   // replaces any older pending capture
+                EnsureWorkerLocked();
+                System.Threading.Monitor.PulseAll(WorkerLock);
+            }
+        }
+
+        // Schedule a bounded recovery attempt on the worker. At most one latest
+        // request exists; blips keep landing in the session delta meanwhile.
+        // The wall-clock instant used by the worker's merge is captured HERE on
+        // the scheduling thread (the production scheduled-audio thread or a
+        // test's main thread): the worker itself never invokes the LocalNow
+        // clock delegate, which a test may implement as a scriptblock that can
+        // only run on the thread that owns it.
+        DateTime RecoveryNow = DateTime.Now;
+
+        void RequestRecovery()
+        {
+            lock (WorkerLock)
+            {
+                if (Disposed) return;
+                RecoveryNow = LocalNow();      // captured on the calling thread
+                PendingRecovery = true;
+                EnsureWorkerLocked();
+                System.Threading.Monitor.PulseAll(WorkerLock);
+            }
+        }
+
+        void EnsureWorkerLocked()
+        {
+            if (Worker != null && Worker.IsAlive) return;
+            Worker = new System.Threading.Thread(WorkerLoop);
+            Worker.IsBackground = true;   // never keeps the process alive
+            Worker.Name = "Problip.StatsPersistence";
+            Worker.Start();
+        }
+
+        void WorkerLoop()
+        {
+            while (true)
+            {
+                PendingCommit work = null;
+                bool recover = false;
+                lock (WorkerLock)
+                {
+                    while (Pending == null && !PendingRecovery)
+                    {
+                        if (Disposed) return;
+                        System.Threading.Monitor.Wait(WorkerLock);
+                        if (Disposed && Pending == null && !PendingRecovery) return;
+                    }
+                    if (PendingRecovery) { PendingRecovery = false; recover = true; }
+                    else { work = Pending; Pending = null; }   // the slot is free again
+                }
+                if (recover) RecoveryCommit();
+                else CommitSnapshot(work);
+            }
+        }
+
+        // One physical whole-file write: write temp, atomically replace. The
+        // caller must own the CommitGate. On any failure the previous complete
+        // snapshot stays on disk and no temporary file survives.
+        bool WriteCommitFile(BlipStatsRecord r)
+        {
             string temp = null;
             try
             {
                 temp = Path + ".tmp";
-                System.IO.File.WriteAllText(temp, Serialize(Record));
-                if (!CommitFile(temp, Path)) return false;
-                temp = null;                       // committed: nothing to clean up
-                Dirty = false;
-                LastFlushMs = NowMs();
-                return true;
+                System.IO.File.WriteAllText(temp, Serialize(r));
+                bool ok = CommitFile(temp, Path);
+                if (ok) temp = null;   // moved into place; nothing left to clean
+                return ok;
             }
             catch { return false; }
             finally
             {
                 if (temp != null) { try { if (System.IO.File.Exists(temp)) System.IO.File.Delete(temp); } catch { } }
             }
+        }
+
+        // ONE physical commit: exclusive through CommitGate, atomic whole-file
+        // replacement, generation-checked completion. Returns whether THIS
+        // commit landed as the newest state.
+        bool CommitSnapshot(PendingCommit pc)
+        {
+            long inFlightGen = pc.Gen;
+            lock (StateLock) { InFlightGen = inFlightGen; }
+            var started = CommitStarted; if (started != null) started();
+            CommitStartedCount++;
+                var pause = PreGatePause; if (pause != null) pause();   // test-only: deterministic pre-gate pause
+                bool ok = false;
+                try
+                {
+                    if (!WaitForCommitGate()) return false;   // bounded: never waits forever
+                    try
+                    {
+                        var gate = CommitFileGate; if (gate != null && !gate()) return false;
+                        // DISK-ORDERING INVARIANT: the LAST eligibility check
+                        // sits immediately before the physical write, while
+                        // owning the gate. A snapshot whose generation is no
+                        // longer the newest published one must never replace
+                        // the committed file: the old post-write generation
+                        // check protected only bookkeeping -- by then the older
+                        // bytes were already on disk. A skipped stale item
+                        // touches nothing, clears no Dirty, and still completes
+                        // its bookkeeping/signalling (the finally below and the
+                        // completion check); the newest published state retries
+                        // through the normal publish/flush paths.
+                        bool eligible;
+                        lock (StateLock) { eligible = pc.Gen == PublishGen; }
+                        if (!eligible) { StaleSkipCount++; return false; }
+                        ok = WriteCommitFile(pc.Snapshot);
+                    }
+                    finally { ExitCommitGate(); }
+                // Generation-checked completion: a stale completion cannot
+                // clear Dirty for newer unpersisted state. The commit gate is
+                // already released here; correctness rests on the generation
+                // check, never on timing.
+                if (ok)
+                {
+                    lock (StateLock)
+                    {
+                        if (pc.Gen == PublishGen && pc.DataVer == DataVersion)
+                        {
+                            Dirty = false;
+                            // Clock directly, NOT the NowMs seam: the worker
+                            // must never invoke test delegates off-thread.
+                            LastFlushMs = Clock.ElapsedMilliseconds;
+                        }
+                        if (pc.Gen > CommittedGen) CommittedGen = pc.Gen;
+                    }
+                }
+                return ok;
+            }
+            finally
+            {
+                lock (StateLock)
+                {
+                    if (InFlightGen == inFlightGen) InFlightGen = 0;
+                }
+                CommitCompletedCount++;
+                var done = CommitCompleted; if (done != null) done();
+                IdleSignal.Set();
+            }
+        }
+
+        // Worker-driven recovery of an unreadable baseline. Bounded and
+        // generation-checked: the attempt window advanced when the request was
+        // scheduled, so a failing recovery retries at the batching cadence.
+        // Never runs on the scheduled-audio thread. The gate is held across
+        // read + merge so a recovery can never double-merge against the
+        // synchronous lifecycle recovery or a reset.
+        void RecoveryCommit()
+        {
+            try
+            {
+                lock (StateLock) { if (BaselineState != StatsBaselineState.Unreadable) return; }
+                RecoveryAttemptCount++;
+                var ra = RecoveryAttempted; if (ra != null) ra();
+                if (!WaitForCommitGate()) return;   // bounded; a later window retries
+                try
+                {
+                    lock (StateLock) { if (BaselineState != StatsBaselineState.Unreadable) return; }
+                    string text;
+                    try { text = ReadText(Path); } catch { return; }         // still unreadable: quarantine holds
+                    if (text == null) return;                                // nothing to recover from
+                    BlipStatsRecord baseline;
+                    try { baseline = ParseRecordText(text); } catch { return; }
+                    long gen, dataVer;
+                    BlipStatsRecord merged;
+                    lock (StateLock)
+                    {
+                        if (BaselineState != StatsBaselineState.Unreadable) return;
+                        // RecoveryNow is a plain DateTime captured on the
+                        // CALLER thread when the request was scheduled -- the
+                        // worker never invokes clock delegates off-thread.
+                        Record = BlipStatsLogic.MergeBaselineAndDelta(baseline, PendingDelta, RecoveryNow);
+                        // The committed value is an immutable captured COPY of
+                        // the merged record, never the live Record: concurrent
+                        // blips from here on mutate Record under StateLock and
+                        // must not tear the snapshot being serialized.
+                        merged = BlipStatsLogic.CopyRecord(Record);
+                        PendingDelta = new BlipStatsRecord();   // captured+cleared atomically: no loss, no double count
+                        BaselineState = StatsBaselineState.Healthy;
+                        DataVersion++;
+                        gen = ++PublishGen;
+                        dataVer = DataVersion;
+                    }
+                    var pauseR = RecoveryCapturePause;
+                    if (pauseR != null) { try { pauseR(); } catch { } }
+                    // Concurrent blips from here on mutate the (healthy) Record
+                    // and bump DataVersion, so this completion will not clear
+                    // their Dirty -- it commits exactly the merged state.
+                    // Pre-write eligibility: if a newer generation was published
+                    // meanwhile, this recovery must not physically write at all.
+                    bool eligibleR;
+                    lock (StateLock) { eligibleR = gen == PublishGen; }
+                    bool ok = eligibleR && WriteCommitFile(merged);
+                    if (ok)
+                    {
+                        lock (StateLock)
+                        {
+                            if (gen == PublishGen && dataVer == DataVersion)
+                            {
+                                Dirty = false;
+                                // Clock directly, NOT the NowMs seam: the
+                                // worker must never invoke delegates off-thread.
+                                LastFlushMs = Clock.ElapsedMilliseconds;
+                            }
+                            if (gen > CommittedGen) CommittedGen = gen;
+                        }
+                    }
+                }
+                finally { ExitCommitGate(); }
+            }
+            finally { IdleSignal.Set(); }
+        }
+
+        // Bounded exclusive physical-commit ownership. Documented bound:
+        // CommitGateTimeoutMs (2 s). Never waits forever; callers decide their
+        // own failure semantics (reset returns false; the worker skips and the
+        // next eligible publication retries; lifecycle flush reports failure).
+        bool WaitForCommitGate() { return System.Threading.Monitor.TryEnter(CommitGate, CommitGateTimeoutMs); }
+        void ExitCommitGate() { System.Threading.Monitor.Exit(CommitGate); }
+
+        // Bounded drain helper (tests/lifecycle): resolves when the worker has
+        // no in-flight commit and no pending work, or after the timeout.
+        internal bool WaitIdle(int timeoutMs)
+        {
+            long start = Clock.ElapsedMilliseconds;
+            while (true)
+            {
+                bool busy;
+                lock (WorkerLock) { busy = Pending != null || PendingRecovery; }
+                if (!busy) lock (StateLock) { busy = InFlightGen != 0; }
+                if (!busy) return true;
+                long remaining = timeoutMs - (Clock.ElapsedMilliseconds - start);
+                if (remaining <= 0) return false;
+                IdleSignal.WaitOne((int)Math.Min(remaining, 100));
+            }
+        }
+
+        // Bounded best-effort disposable worker: idempotent, background-owned,
+        // bounded join, no Thread.Abort, no unbounded waits. TRUTHFUL
+        // ALREADY-STARTED-I/O LIMIT: a filesystem call that has already ENTERED
+        // WriteCommitFile (File.WriteAllText, File.Replace, or any CommitFile
+        // implementation) cannot be cancelled -- there is no cancellation
+        // primitive in this architecture. The guarantees are exactly:
+        //   - only one physical writer owns CommitGate at a time;
+        //   - an older generation that has NOT yet entered its physical write
+        //     is skipped by the pre-write eligibility check once superseded;
+        //   - an already-entered physical write may finish asynchronously if
+        //     the underlying I/O was blocked, writing the (older) content it
+        //     captured before shutdown began;
+        //   - because CommitGate serializes physical writers, that
+        //     already-entered write can never overwrite a NEWER COMMITTED
+        //     write that occurred through the same store;
+        //   - terminal shutdown is therefore best-effort-bounded, never
+        //     instant, when underlying physical I/O is unresponsive.
+        // DURABILITY LIMIT (see Cleanup()): the pre-teardown lifecycle flush is
+        // only a bounded ATTEMPT. If an already-started physical commit holds
+        // CommitGate beyond the timeout, the final flush fails and the newest
+        // state stays dirty/in-memory. Pending not-yet-entered work is dropped
+        // here (its generation can never land after the flush attempt).
+        internal void ShutdownPersistence()
+        {
+            lock (WorkerLock)
+            {
+                if (Disposed) return;
+                Disposed = true;
+                Pending = null;
+                PendingRecovery = false;
+                System.Threading.Monitor.PulseAll(WorkerLock);
+            }
+            System.Threading.Thread w = Worker;
+            if (w != null && w.IsAlive) w.Join(CommitGateTimeoutMs);
+        }
+
+        // Synchronous, gate-exclusive flush of the CURRENT record for the
+        // lifecycle paths (Stop/exit). Synchronous by contract: an explicit
+        // lifecycle flush must be observable on disk before Stop returns, but
+        // it is still bounded -- it takes the same physical-commit gate with
+        // the documented timeout so a blocked worker commit cannot deadlock
+        // shutdown.
+        bool FlushSyncUnderGate()
+        {
+            long gen, dataVer;
+            BlipStatsRecord snap;
+            lock (StateLock)
+            {
+                LastFlushAttemptMs = NowMs();
+                FlushAttemptCount++;
+                // IMMUTABLE capture: serialize an immutable copy of the seven
+                // persisted fields, never the live Record object. The lock is
+                // released below and concurrent blips keep mutating Record;
+                // serializing the live object would tear the file across
+                // pre/post-mutation values.
+                snap = BlipStatsLogic.CopyRecord(Record);
+                gen = ++PublishGen;
+                dataVer = DataVersion;
+            }
+            var pauseF = FlushCapturePause; if (pauseF != null) pauseF();   // test-only: deterministic capture/commit gap
+            bool ok = false;
+            if (!WaitForCommitGate()) return false;
+            try
+            {
+                // Pre-write eligibility, same disk-ordering invariant as the
+                // worker path: this flush may only physically write while its
+                // generation is still the newest published one. A reset (or a
+                // concurrent lifecycle flush) that superseded this generation
+                // must win on disk; this flush then writes nothing.
+                bool eligible;
+                lock (StateLock) { eligible = gen == PublishGen; }
+                if (!eligible) return false;
+                ok = WriteCommitFile(snap);
+                if (ok)
+                {
+                    lock (StateLock)
+                    {
+                        if (gen == PublishGen && dataVer == DataVersion)
+                        {
+                            Dirty = false;
+                            LastFlushMs = NowMs();
+                        }
+                        if (gen > CommittedGen) CommittedGen = gen;
+                    }
+                }
+                return ok;
+            }
+            finally { ExitCommitGate(); }
+        }
+
+        // Bounded synchronous recovery for the explicit lifecycle paths (Flush/
+        // FlushIfDirty). Holds the gate across read+merge so it can never
+        // double-merge against the worker recovery or a reset. Returns whether
+        // THIS attempt recovered the baseline.
+        bool TryRecoverSync()
+        {
+            lock (StateLock) { if (BaselineState != StatsBaselineState.Unreadable) return false; }
+            RecoveryAttemptCount++;
+            var ra = RecoveryAttempted; if (ra != null) ra();
+            if (!WaitForCommitGate()) return false;
+            try
+            {
+                lock (StateLock) { if (BaselineState != StatsBaselineState.Unreadable) return false; }
+                string text;
+                try { text = ReadText(Path); } catch { return false; }
+                if (text == null) return false;
+                BlipStatsRecord baseline;
+                try { baseline = ParseRecordText(text); } catch { return false; }
+                lock (StateLock)
+                {
+                    if (BaselineState != StatsBaselineState.Unreadable) return false;
+                    Record = BlipStatsLogic.MergeBaselineAndDelta(baseline, PendingDelta, LocalNow());
+                    PendingDelta = new BlipStatsRecord();
+                    BaselineState = StatsBaselineState.Healthy;
+                    DataVersion++;
+                }
+                return true;
+            }
+            finally { ExitCommitGate(); }
+        }
+
+        // Best-effort write of the newest in-memory snapshot. Lifecycle
+        // semantics preserved: explicit, synchronous, allowed to ignore the
+        // batching window, never throws, bounded by the commit gate. While the
+        // baseline is unreadable this attempts recovery first (merging the
+        // persisted baseline and the session delta exactly once) and NEVER
+        // writes anything while the file is still unknown -- a failed recovery
+        // leaves the original disk bytes untouched.
+        public bool Flush()
+        {
+            bool unreadable;
+            lock (StateLock) { unreadable = BaselineState == StatsBaselineState.Unreadable; }
+            if (unreadable) TryRecoverSync();
+            lock (StateLock) { unreadable = BaselineState == StatsBaselineState.Unreadable; }
+            if (unreadable) return false;   // still unknown: quarantine holds
+            return FlushSyncUnderGate();
         }
 
         // The complete [stats] section as one text block. This exact string is
@@ -892,33 +1532,126 @@ namespace Problip
         // Flush only when there is unpersisted state. Used on Stop and exit --
         // an explicit lifecycle flush is allowed to ignore the batching window
         // (a Stop 3 s after a failed automatic attempt must still try once
-        // more, not skip the final write).
+        // more, not skip the final write). Synchronous but bounded.
         public bool FlushIfDirty()
         {
-            if (!Dirty) return true;
+            lock (StateLock)
+            {
+                if (!Dirty) return true;
+            }
             return Flush();
         }
 
-        void Load()
+        // Atomic reset: zeroes all four counters in one candidate commit.
+        // PERF-001 ordering: the reset acquires the SAME physical-commit gate
+        // the worker uses, with the documented bounded wait. While it owns the
+        // gate no worker commit can be in its physical section; the reset
+        // advances the generation and clears the pending slot so every
+        // pre-reset snapshot and recovery request is invalidated -- a late
+        // worker completion of a stale generation is dropped at its generation
+        // check and can never overwrite the zero snapshot or resurrect old
+        // counters. A failed commit (or a failed bounded gate acquisition)
+        // changes neither memory nor disk, returns false, and leaves no
+        // delayed reset queued. While the baseline is unreadable the reset is
+        // still an explicit user action: success zeroes both the delta and the
+        // record and marks the baseline healthy (a confirmed destructive path
+        // replaces the unknown file); failure leaves every field untouched.
+        public bool TryResetAll()
+        {
+            BlipStatsRecord next = new BlipStatsRecord();
+            lock (StateLock)
+            {
+                next.DayKey = Record.DayKey;
+                next.WeekKey = Record.WeekKey;
+                next.MonthKey = Record.MonthKey;
+            }
+            // Invalidate pre-reset work BEFORE taking the gate: pending
+            // snapshots published earlier are discarded, and the generation
+            // bump makes any already-in-flight pre-reset commit stale.
+            lock (StateLock) { PublishGen++; }
+            lock (WorkerLock) { Pending = null; PendingRecovery = false; }
+            if (!WaitForCommitGate())
+            {
+                // Bounded wait expired under worker contention: no reset
+                // happened, nothing is queued for later. (The generation bump
+                // is harmless: it only invalidates, never commits.)
+                return false;
+            }
+            try
+            {
+                bool ok = WriteCommitFile(next);
+                if (!ok) return false;
+                lock (StateLock)
+                {
+                    PublishGen++;             // the reset generation is now newest
+                    Record = next;
+                    PendingDelta = new BlipStatsRecord();
+                    BaselineState = StatsBaselineState.Healthy;
+                    Dirty = false;
+                    DataVersion++;
+                    LastFlushMs = NowMs();
+                    if (PublishGen > CommittedGen) CommittedGen = PublishGen;
+                }
+                lock (WorkerLock)
+                {
+                    Pending = null;   // obsolete pre-reset pending work is gone
+                }
+                return true;
+            }
+            finally { ExitCommitGate(); }
+        }
+
+        // -- Baseline load + managed INI reader --
+
+        // Startup baseline: a missing file is a KNOWN zero baseline (Missing);
+        // an existing file that cannot be read is UNKNOWN (Unreadable) and is
+        // quarantined -- never overwritten by an automatic write.
+        public void Load()
         {
             try
             {
-                BlipStatsRecord r = new BlipStatsRecord();
-                Dictionary<string, string> kv = ParseIniText(ReadAllTextBestEffort(Path));
-                r.DayKey = Get(kv, "DayKey");
-                r.TodayCount = SanitizeCount(kv, "TodayCount");
-                r.WeekKey = Get(kv, "WeekKey");
-                r.WeekCount = SanitizeCount(kv, "WeekCount");
-                r.MonthKey = Get(kv, "MonthKey");
-                r.MonthCount = SanitizeCount(kv, "MonthCount");
-                r.TotalCount = SanitizeCount(kv, "TotalCount");
-                Record = r;
+                string text = ReadText(Path);
+                if (text == null)
+                {
+                    lock (StateLock)
+                    {
+                        Record = new BlipStatsRecord();
+                        BaselineState = StatsBaselineState.Missing;
+                        Dirty = false;
+                    }
+                    return;
+                }
+                BlipStatsRecord r = ParseRecordText(text);
+                lock (StateLock)
+                {
+                    Record = r;
+                    BaselineState = StatsBaselineState.Healthy;
+                    Dirty = false;
+                }
             }
             catch
             {
-                Record = new BlipStatsRecord();
+                lock (StateLock)
+                {
+                    Record = new BlipStatsRecord();
+                    BaselineState = StatsBaselineState.Unreadable;
+                    Dirty = false;
+                }
             }
-            Dirty = false;
+        }
+
+        static BlipStatsRecord ParseRecordText(string text)
+        {
+            Dictionary<string, string> kv = ParseIniText(text);
+            BlipStatsRecord r = new BlipStatsRecord();
+            r.DayKey = Get(kv, "DayKey");
+            r.TodayCount = SanitizeCount(kv, "TodayCount");
+            r.WeekKey = Get(kv, "WeekKey");
+            r.WeekCount = SanitizeCount(kv, "WeekCount");
+            r.MonthKey = Get(kv, "MonthKey");
+            r.MonthCount = SanitizeCount(kv, "MonthCount");
+            r.TotalCount = SanitizeCount(kv, "TotalCount");
+            return r;
         }
 
         // Minimal managed INI reader for THIS file's single [stats] section.
@@ -954,16 +1687,6 @@ namespace Problip
             return kv;
         }
 
-        static string ReadAllTextBestEffort(string target)
-        {
-            try
-            {
-                if (System.IO.File.Exists(target)) return System.IO.File.ReadAllText(target);
-            }
-            catch { }
-            return "";
-        }
-
         static string Get(Dictionary<string, string> kv, string key)
         {
             string v;
@@ -979,7 +1702,6 @@ namespace Problip
             return BlipStatsLogic.Sanitize(v);
         }
     }
-
     // Blip engine: plays a volume-scaled WAV on a jittered interval.
     class BlipEngine
     {
@@ -1041,6 +1763,9 @@ namespace Problip
         // harmless tick. The tray and any open settings window subscribe so a
         // mid-wait playback failure is visible without a user click.
         public event EventHandler StateChanged;
+        // Terminal-teardown guard: Cleanup() is idempotent and must shut the
+        // statistics worker down exactly once (Stop() alone never does).
+        bool _cleanedUp;
 
         // The ONE successful-blip signal: raised only after a scheduled Tick's
         // PlayNow() succeeds. Preview()/TEST/failed playback never raise it. It
@@ -1403,11 +2128,13 @@ namespace Problip
             // regression where Tick merely re-arms without playing must fail
             // the scheduled-count assertion instead of passing structurally.
             ScheduledPlayCount++;
-            // One successful scheduled blip == one recorded count. Memory is
-            // updated BEFORE subscribers repaint, so a BlipPlayed handler sees
-            // the new total. A stats flush failure is absorbed inside the store
-            // and can never throw into this audio path.
-            Stats.RecordBlip();
+            // One successful scheduled blip == one recorded count, unless
+            // recording is paused: audio and the BlipPlayed signal continue but
+            // the statistics total stays frozen. Memory is updated BEFORE
+            // subscribers repaint, so a BlipPlayed handler sees the new total.
+            // A stats flush failure is absorbed inside the store and can never
+            // throw into this audio path.
+            if (S.StatsEnabled) Stats.RecordBlip();
             RaiseBlipPlayed();
             ArmTimer(NextDelay());
         }
@@ -1566,11 +2293,39 @@ namespace Problip
             }
         }
 
-        // Called on the way out: drop the last temp WAV so a normal exit leaves
-        // nothing behind in %TEMP%. Idempotent -- a second call is a no-op.
+        // Called on the way out: flush and finalize statistics, drop the last
+        // temp WAV so a normal exit leaves nothing behind in %TEMP%. Idempotent
+        // -- a second call is a no-op.
+        //
+        // TERMINAL lifecycle contract (unlike Stop(), which must leave the
+        // persistence worker alive so a later Start() in the same process can
+        // keep batching):
+        //   1. Stop() first: it performs a bounded final synchronous
+        //      persistence ATTEMPT. When CommitGate is available, the newest
+        //      captured state reaches disk BEFORE the worker is shut down.
+        //      When an already-started physical operation holds CommitGate
+        //      beyond the bound, the final flush fails and the newest state
+        //      remains dirty/in-memory -- final durability is NOT guaranteed
+        //      while the underlying physical writer itself is blocked.
+        //      (Regression 10c proves exactly this path: the old physical
+        //      commit is in progress, the final flush times out on CommitGate,
+        //      Cleanup returns bounded, and the already-entered older write
+        //      may later complete.)
+        //   2. Stats.ShutdownPersistence() then performs the bounded best-effort
+        //      teardown of the ONE persistence worker: pending not-yet-entered
+        //      stale work is discarded/skipped (its generation can never land
+        //      after the flush attempt), the join is bounded, and exit cannot
+        //      hang on statistics. LIMIT: an already-entered physical write
+        //      cannot be cancelled; it may complete asynchronously once the
+        //      blocked I/O unblocks, but CommitGate serialization means it can
+        //      never overwrite a newer commit through the same store.
+        //   3. Subsequent calls are no-ops on both levels.
         public void Cleanup()
         {
+            if (_cleanedUp) return;
+            _cleanedUp = true;
             Stop();
+            if (Stats != null) Stats.ShutdownPersistence();   // terminal only: bounded worker teardown AFTER the final flush
             if (Timer != null)
             {
                 Timer.Tick -= Tick;
@@ -1644,9 +2399,208 @@ namespace Problip
         }
     }
 
+    // Four-state autostart transaction. The toggle direction derives from the
+    // persisted INI intent, never from the registry; the Run key is a verified
+    // projection, repaired from that intent on every launch.
+    enum AutoStartResult
+    {
+        Success,
+        ForwardProjectionFailed,
+        PersistenceFailedRollbackSucceeded,
+        PersistenceFailedRollbackFailed
+    }
+
+    // Persistence ownership bound to the data directory (problip.ini / problip.stats.ini).
+    // Derives a deterministic mutex name from the normalized full path so that:
+    // - same directory across sessions (Global namespace) is single-writer;
+    // - different portable directories in the same session get distinct mutexes.
+    // Handles abandoned mutex as recovery, not corruption.
+    sealed class PersistenceOwnership : IDisposable
+    {
+        private System.Threading.Mutex _m;
+        private PersistenceOwnership(System.Threading.Mutex m) { _m = m; }
+
+        // Returns the canonical Global-namespace mutex name for the given directory.
+        // Normalizes: full path, uppercase invariant.
+        public static string NameForDirectory(string dir)
+        {
+            string full = System.IO.Path.GetFullPath(dir).ToUpperInvariant();
+            full = full.TrimEnd(System.IO.Path.DirectorySeparatorChar);
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+            {
+                byte[] hash = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(full));
+                var sb = new System.Text.StringBuilder(64);
+                foreach (byte b in hash) sb.Append(b.ToString("X2"));
+                return "Global\\Problip.Persistence." + sb.ToString();
+            }
+        }
+
+        // Attempts to acquire ownership for the directory. Returns true on success,
+        // false if another process already owns it. The caller MUST dispose the
+        // returned Ownership to release the lock.
+        public static bool TryAcquire(string dir, out PersistenceOwnership ownership)
+        {
+            ownership = null;
+            if (string.IsNullOrEmpty(dir)) return false;
+            string name = NameForDirectory(dir);
+            try
+            {
+                bool createdNew;
+                var m = new System.Threading.Mutex(true, name, out createdNew);
+                if (!createdNew)
+                {
+                    m.Dispose();
+                    return false;
+                }
+                ownership = new PersistenceOwnership(m);
+                return true;
+            }
+            catch { return false; }
+        }
+
+        public void Dispose()
+        {
+            if (_m != null)
+            {
+                try { _m.ReleaseMutex(); } catch { }
+                _m.Dispose();
+                _m = null;
+            }
+        }
+    }
+
+    // Shared autostart seam for both UI surfaces. Registry operations are
+    // injectable so the rollback-postcondition matrix can force compensating
+    // failures without touching a real Run key.
+    static class StartupCommands
+    {
+        internal static Func<string, string, bool> RegSet = AutoStart.Set;
+        internal static Func<string, bool> RegClear = AutoStart.Clear;
+        internal static Func<string, string, bool> RegIsEnabled = AutoStart.IsEnabled;
+        // Whether the last verified projection agreed with the persisted
+        // intent. Paint reads this flag; paint never touches the registry.
+        internal static bool ProjectionHealthy = true;
+
+        public static AutoStartResult SetAutoStart(Settings s, string keyPath, string exePath)
+        {
+            bool previous = s.AutoStart;
+            bool enable = !previous;
+            bool forward = enable ? RegSet(keyPath, exePath) : RegClear(keyPath);
+            if (!forward) return AutoStartResult.ForwardProjectionFailed;
+            try
+            {
+                s.AutoStart = enable;
+                s.Save("AutoStart", enable ? "1" : "0");
+            }
+            catch (System.IO.IOException)
+            {
+                bool rolledBack = enable ? RegClear(keyPath) : RegSet(keyPath, exePath);
+                s.AutoStart = previous;
+                ProjectionHealthy = rolledBack;
+                return rolledBack
+                    ? AutoStartResult.PersistenceFailedRollbackSucceeded
+                    : AutoStartResult.PersistenceFailedRollbackFailed;
+            }
+            ProjectionHealthy = true;
+            return AutoStartResult.Success;
+        }
+
+        // Startup reconciliation: project the persisted intent onto the Run
+        // key, never rewrite the intent. A failure degrades the health flag
+        // and leaves the intent intact for a later repair.
+        internal static void ProjectAtStartup(Settings s, string keyPath, string exePath)
+        {
+            bool ok = s.AutoStart ? RegSet(keyPath, exePath) : RegClear(keyPath);
+            ProjectionHealthy = ok;
+        }
+
+        internal static string ResultText(AutoStartResult result, Settings s)
+        {
+            switch (result)
+            {
+                case AutoStartResult.Success:
+                    return "Autostart " + (s.AutoStart ? "enabled" : "disabled") + ".";
+                case AutoStartResult.ForwardProjectionFailed:
+                    return "Could not change the startup entry.\r\nThe autostart setting was not changed.\r\n" + s.IniPath;
+                case AutoStartResult.PersistenceFailedRollbackSucceeded:
+                    return "Could not save the autostart setting.\r\nThe previous value stays in effect.\r\n" + s.IniPath;
+                default:
+                    return "The autostart setting was not changed.\r\nThe startup entry and the setting disagree.\r\n" + s.IniPath;
+            }
+        }
+    }
+
+    // Shared preference seam for every UI surface: persist first, project
+    // second. A failed save keeps the previous value and returns false;
+    // recording, audio and glow never diverge between surfaces.
+    static class PreferenceCommands
+    {
+        public static bool SetShowBlipCounter(Settings s, bool next, Action changed)
+        {
+            bool previous = s.ShowBlipCounter;
+            try { s.Save("ShowBlipCounter", next ? "1" : "0"); }
+            catch (System.IO.IOException) { return false; }
+            s.ShowBlipCounter = next;
+            if (changed != null && next != previous) changed();
+            return true;
+        }
+
+        public static bool SetStatsEnabled(Settings s, BlipEngine engine, bool next, Action changed)
+        {
+            bool previous = s.StatsEnabled;
+            try { s.Save("StatsEnabled", next ? "1" : "0"); }
+            catch (System.IO.IOException) { return false; }
+            s.StatsEnabled = next;
+            if (changed != null && next != previous) changed();
+            return true;
+        }
+
+        public static bool SetPreviewOnVolumeChange(Settings s, bool next, Action changed)
+        {
+            bool previous = s.PreviewOnVolumeChange;
+            try { s.Save("PreviewOnVolumeChange", next ? "1" : "0"); }
+            catch (System.IO.IOException) { return false; }
+            s.PreviewOnVolumeChange = next;
+            if (changed != null && next != previous) changed();
+            return true;
+        }
+
+        public static bool SetBlipGlow(Settings s, bool next, Action stopGlow, Action repaint)
+        {
+            bool previous = s.BlipGlow;
+            try { s.Save("BlipGlow", next ? "1" : "0"); }
+            catch (System.IO.IOException) { return false; }
+            s.BlipGlow = next;
+            if (!next && stopGlow != null) stopGlow();
+            if (repaint != null && next != previous) repaint();
+            return true;
+        }
+
+        public static bool SetAlwaysOnTop(Settings s, bool next, Action changed)
+        {
+            bool previous = s.AlwaysOnTop;
+            try { s.Save("AlwaysOnTop", next ? "1" : "0"); }
+            catch (System.IO.IOException) { return false; }
+            s.AlwaysOnTop = next;
+            Program.ApplyAlwaysOnTopToWindows();
+            if (changed != null && next != previous) changed();
+            return true;
+        }
+
+        // Shared atomic reset behind a confirmation: declined is a no-op that
+        // still reports success; accepted runs the store's atomic commit.
+        public static bool ResetAll(BlipEngine engine, Func<bool> confirm, Action changed)
+        {
+            if (confirm != null && !confirm()) return true;
+            if (!engine.Stats.TryResetAll()) return false;
+            if (changed != null) changed();
+            return true;
+        }
+    }
+
     class ProblipForm : Form
     {
-        Settings S;
+        public Settings S;
         BlipEngine Engine;
         NotifyIcon Tray;
         List<HotZone> Hot = new List<HotZone>();
@@ -1656,6 +2610,7 @@ namespace Problip
         // resident for days.
         Dictionary<int, Font> Fonts = new Dictionary<int, Font>();
         StringFormat Centered = new StringFormat();
+        public Settings SettingsRef { get { return S; } }
         Rectangle VolTrack;
         bool VolDragging = false;
         // The volume committed when the drag started. If the release cannot
@@ -1682,7 +2637,8 @@ namespace Problip
         // Opens the single reusable Help window. Wired by Program so the title
         // bar "?" button, F1 and the tray Help item share one instance.
         public Action OpenHelp;
-        internal Rectangle BlipsRect;
+        public Action OpenPreferences;
+        internal Rectangle BlipsRect, PrefsRect;
         // Mode-row hit zones (MANUAL / PULSE).
         internal Rectangle ManualRect, PulseRect;
         // Title-bar geometry for the layout regression: the "?" Help button, the
@@ -1827,7 +2783,7 @@ namespace Problip
             }
             BackColor = Palette.BG;
             DoubleBuffered = true;
-            TopMost = true;
+            TopMost = s.AlwaysOnTop;
             // Apply the persisted theme to THIS form at construction (BackColor
             // and child state; the paint reads Palette.* directly).
             ApplyTheme();
@@ -2052,12 +3008,14 @@ namespace Problip
             // OFF and ON toward the left, autostart anchored left. The row
             // can no longer clip a label ("TEST" -> "TE" happened because
             // the rect was a hard-coded guess).
-            bool ao = AutoStartEnabled();
+            bool ao = S.AutoStart;
+            string autoLabel = (ao ? "[X] autostart" : "[ ] autostart") + (StartupCommands.ProjectionHealthy ? "" : " !");
             int needW;
             LayoutBottomRow(g, out needW);
+            AutoStartPaintedLabel = autoLabel;
             var ar = AutoRect;
             Hot.Add(MakeHot(ar, delegate() { ToggleAutostart(); }));
-            DrawButton(g, ar, ao ? "[X] autostart" : "[ ] autostart", ao, 10);
+            DrawButton(g, ar, autoLabel, ao, 10);
 
             // ON/OFF reflect the ACTUAL runtime state (ERR = neither selected;
             // the status text above stays the authoritative health indicator).
@@ -2075,6 +3033,11 @@ namespace Problip
             var tr = TestRect;
             Hot.Add(MakeHot(tr, delegate() { Engine.Preview(); SyncTray(); Refresh(); }));
             DrawButton(g, tr, "TEST", false, 9);
+
+            int prefsW = TextW(g, "PREFS", 9) + 14;
+            PrefsRect = new Rectangle(8, PrefsRowY, prefsW, 22);
+            Hot.Add(MakeHot(PrefsRect, delegate() { if (OpenPreferences != null) OpenPreferences(); }));
+            DrawButton(g, PrefsRect, "PREFS", false, 9);
 
             // The reason, in the window, when there is one. Pressing ON with a
             // broken asset retries the load and this line either goes away or
@@ -2135,6 +3098,12 @@ namespace Problip
 
         // Bottom-row hit zones, shared by OnPaint and the layout regression.
         internal Rectangle AutoRect, StartRect, StopRect, TestRect;
+        // Painted autostart label: persisted intent plus the shared degraded
+        // projection marker. Paint performs zero registry reads.
+        internal string AutoStartPaintedLabel;
+        // Repaints the open preference surfaces through the one central hook
+        // (also wired by Program for cross-surface changes).
+        internal static Action RefreshPreferenceWindows = delegate() { Program.RefreshPreferenceWindows(); };
         // Row geometry, shared by OnPaint, the layout methods and the layout
         // regression: preset row, mode row, bottom row and the failure line
         // under the bottom row.
@@ -2142,7 +3111,19 @@ namespace Problip
         internal const int ModeRowY = 94;
         internal const int UtilityRowY = 122;
         internal const int BottomRowY = 148;
-        internal const int FailureTextY = BottomRowY + 26;   // 174
+        internal const int PrefsRowY = BottomRowY + 26;
+        // The one shared confirmation contract for the destructive RESET ALL
+        // command behind BOTH UI surfaces (Statistics view and Preferences).
+        // Production default: one WinForms dialog naming exactly what is
+        // destroyed (Today / Week / Month / Total history). Tests inject a
+        // delegate here; production never bypasses the confirmation.
+        internal static Func<bool> ResetConfirmation = delegate()
+        {
+            return MessageBox.Show(null,
+                "Reset ALL statistics?\r\n\r\nToday, this week, this month and the total history\r\nwill be permanently reset to zero.",
+                "problip", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) == DialogResult.OK;
+        };
+        internal const int FailureTextY = PrefsRowY + 26;
         // The THEME row's fixed "THEME" label allowance plus the gap before the
         // theme name; the name itself truncates inside the remaining width.
         internal const int ThemeLabelW = 40;
@@ -2154,7 +3135,7 @@ namespace Problip
         // just left of the GLOW button.
         int ThemeNameMaxWidth(Graphics g)
         {
-            return GlowRect.X - 8 - (ThemeRect.X + ThemeLabelW + 6);
+            return GlowRect.X - 8 - (8 + ThemeLabelW + 6);
         }
 
         // Truncate the theme name with real text measurement so a long name
@@ -2175,10 +3156,11 @@ namespace Problip
         {
             const int yu = UtilityRowY, h = 22, margin = 8;
             int glowW = Math.Max(TextW(g, "[X] GLOW", 9), TextW(g, "[ ] GLOW", 9)) + 14;
-            GlowRect = new Rectangle(Width - margin - glowW, yu, glowW, h);
-            ThemeRect = new Rectangle(margin, yu, 0, h);
-            ThemeNameRect = new Rectangle(ThemeRect.X + ThemeLabelW + 6, yu,
-                Math.Max(10, ThemeNameMaxWidth(g)), h);
+            GlowRect = new Rectangle(Width - 8 - glowW, yu, glowW, h);
+            int nameLeft = margin + ThemeLabelW + 6;
+            int nameW = Math.Max(10, GlowRect.X - 8 - nameLeft);
+            ThemeNameRect = new Rectangle(nameLeft, yu, nameW, h);
+            ThemeRect = new Rectangle(margin, yu, nameLeft + nameW - margin, h);
         }
         // Mode-row width need, written by OnPaint through LayoutModeRow (the
         // ctor also consults it before the window exists; Out parameter cannot
@@ -2211,8 +3193,8 @@ namespace Problip
             const int yb = BottomRowY, h = 22, gap = 4, margin = 8;
             int testW = TextW(g, "TEST", 9) + 14;
             int pairW = Math.Max(TextW(g, "OFF", 12), TextW(g, "ON", 12)) + 14;
-            int autoW = Math.Max(TextW(g, "[X] autostart", 10), TextW(g, "[ ] autostart", 10)) + 14;
-            TestRect = new Rectangle(Width - margin - testW, yb, testW, h);
+            int autoW = Math.Max(Math.Max(TextW(g, "[X] autostart", 10), TextW(g, "[ ] autostart", 10)), TextW(g, "[X] autostart !", 10)) + 14;
+            TestRect = new Rectangle(Width - 8 - testW, yb, testW, h);
             StopRect = new Rectangle(TestRect.X - gap - pairW, yb, pairW, h);
             StartRect = new Rectangle(StopRect.X - gap - pairW, yb, pairW, h);
             AutoRect = new Rectangle(margin, yb, autoW, h);
@@ -2236,11 +3218,23 @@ namespace Problip
             Invalidate();
         }
 
+        // Committed a volume: preview exactly once through the shared
+        // preference, then refresh. A rejected value never reaches here.
+        internal void CommitVolumePreview()
+        {
+            if (S.PreviewOnVolumeChange) Engine.Preview();
+            SyncTray();
+            Refresh();
+        }
+
+        void PreviewAfterVolumeCommit() { CommitVolumePreview(); }
+
         // Commits the dragged volume. A failed save must NOT look saved: the
         // committed value is restored everywhere (slider, session, scaled cache)
         // and the failure is reported, rather than the UI silently showing a value
         // the INI will overwrite on restart. A rejected value is never previewed.
-        // On success: rebuild once at the new volume, then preview exactly once.
+        // On success: rebuild once at the new volume, then preview exactly once
+        // (unless the shared PreviewOnVolumeChange preference is off).
         void EndVolumeDrag()
         {
             if (!VolDragging) return;
@@ -2260,9 +3254,7 @@ namespace Problip
                 return;
             }
             Engine.Reload();
-            Engine.Preview();
-            SyncTray();
-            Refresh();
+            PreviewAfterVolumeCommit();
         }
 
         // Modal or testable notice that a user-triggered persistence change could
@@ -2304,20 +3296,13 @@ namespace Problip
         // never creates a glow by itself.
         internal void ToggleGlow()
         {
-            bool previous = S.BlipGlow;
-            bool next = !previous;
-            try
-            {
-                S.Save("BlipGlow", next ? "1" : "0");
-            }
-            catch (System.IO.IOException)
+            bool next = !S.BlipGlow;
+            if (!PreferenceCommands.SetBlipGlow(S, next, StopGlow, Program.RefreshPreferenceWindows))
             {
                 ShowSettingsSaveError("glow");
                 Refresh();
                 return;
             }
-            S.BlipGlow = next;
-            if (!next) StopGlow();      // OFF: halt the running animation now
             Refresh();
         }
 
@@ -2418,64 +3403,31 @@ namespace Problip
 
         // True only when the Run entry exists AND points at this executable.
         // A stale "Problip" value from a moved/deleted copy used to present an
-        // old path as a healthy enabled state.
+        // old path as a healthy enabled state. Paint never calls this: the
+        // persisted INI intent is the display authority, the registry is only
+        // a verified projection.
         bool AutoStartEnabled()
         {
-            return AutoStart.IsEnabled(AutoStartKeyPath, Application.ExecutablePath);
+            return StartupCommands.RegIsEnabled(AutoStartKeyPath, Application.ExecutablePath);
         }
 
         // problip.ini is the authoritative setting; the Run key is its projection,
         // reapplied from the INI on every launch (see Main). Registry and INI are
-        // one user operation: if either half fails the other is restored AND the
-        // in-memory S.AutoStart goes back to its previous value, so the durable and
-        // in-memory states agree after the rollback instead of leaving the session
-        // believing a setting the INI never accepted.
+        // one user operation through StartupCommands: both surfaces share the
+        // four-state transaction, and every outcome repaints the preference
+        // windows through the one central hook.
         void ToggleAutostart()
         {
-            bool previousAutoStart = S.AutoStart;
-            bool enable = !AutoStartEnabled();
-            bool registryDone = false;
-            bool rolledBack = true;
-            try
+            AutoStartResult result = StartupCommands.SetAutoStart(S, AutoStartKeyPath, Application.ExecutablePath);
+            if (result != AutoStartResult.Success)
             {
-                // Set/Clear only report success after the Run entry is verified
-                // to match this executable (or, for Clear, to be gone). A
-                // mutation that did not land as requested is not "done".
-                registryDone = enable
-                    ? AutoStart.Set(AutoStartKeyPath, Application.ExecutablePath)
-                    : AutoStart.Clear(AutoStartKeyPath);
-                if (!registryDone)
-                    throw new System.IO.IOException("the Run-key change was not verified");
-                S.AutoStart = enable;
-                S.Save("AutoStart", enable ? "1" : "0");
-            }
-            catch
-            {
-                if (registryDone)
-                {
-                    // INI write failed after the Run key changed: roll the
-                    // registry back to the previous consistent state. A rollback
-                    // that itself fails is reported, never silently accepted.
-                    rolledBack = false;
-                    try
-                    {
-                        bool back = enable
-                            ? AutoStart.Clear(AutoStartKeyPath)
-                            : AutoStart.Set(AutoStartKeyPath, Application.ExecutablePath);
-                        rolledBack = back;
-                    }
-                    catch { }
-                }
-                S.AutoStart = previousAutoStart;
-                if (!rolledBack)
-                    NotifySettingsError("autostart",
-                        "The autostart setting could not be committed\r\nand could not be rolled back cleanly.\r\n" + S.IniPath);
-                else
-                    ShowSettingsSaveError("autostart");
+                NotifySettingsError("autostart", StartupCommands.ResultText(result, S));
                 Refresh();
+                RefreshPreferenceWindows();
                 return;
             }
             Refresh();
+            RefreshPreferenceWindows();
         }
 
         protected override void OnMouseDown(MouseEventArgs e)
@@ -2514,6 +3466,381 @@ namespace Problip
             }
         }
 
+// Preview exactly once after a volume commit when the shared preference
+        // is on. The failure path restores committed value and MUST NOT preview.
+        internal void CommitVolumePreview2() { CommitVolumePreview(); }
+
+    }
+
+    // Preferences / Control Center. One reusable window (main PREFS row or the
+    // tray Preferences item) groups every behavioral switch; each control
+    // routes through the shared PreferenceCommands/StartupCommands seam, so a
+    // setting changed from another surface stays in sync with no polling.
+    class PreferencesForm : Form
+    {
+        public Settings S;
+        BlipEngine Engine;
+        List<ProblipForm.HotZone> Hot = new List<ProblipForm.HotZone>();
+        Dictionary<int, Font> Fonts = new Dictionary<int, Font>();
+        StringFormat Centered = new StringFormat();
+        // Unit seam: persistence-failure notices land here instead of a modal
+        // MessageBox, so regressions can observe the revert path.
+        System.Action<string> SettingsErrorSink;
+        // Unit seam: tests point this at a disposable key so ToggleAutostart
+        // never touches a developer's real Run entry (same seam as the main
+        // surface).
+        string AutoStartKeyPath = AutoStart.RunKeyPath;
+
+        // Painted geometry, exposed for the UI layout regressions.
+        internal Rectangle OnRect, OffRect, AutoStartRect, PreviewRect, TestRect;
+        internal Rectangle StatsEnabledRect, ShowCounterRect, ViewRect, ResetAllRect;
+        internal Rectangle GlowRect, TopRect, ThemeNameRect, ChangeRect;
+        internal Rectangle CloseRect;
+        // Painted autostart label: persisted intent plus the shared degraded
+        // projection marker, identical to the main surface.
+        internal string AutoStartPaintedLabel;
+
+        const int RowH = 22;
+
+        public PreferencesForm(Settings s, BlipEngine engine)
+        {
+            S = s; Engine = engine;
+            Centered.Alignment = StringAlignment.Center;
+            Centered.LineAlignment = StringAlignment.Center;
+            Text = "problip preferences";
+            FormBorderStyle = FormBorderStyle.None;
+            StartPosition = FormStartPosition.CenterScreen;
+            ClientSize = new Size(400, 248);
+            BackColor = Palette.BG;
+            DoubleBuffered = true;
+            TopMost = s.AlwaysOnTop;
+            ApplyTheme();
+            // Async runtime truth without a click: any engine state transition
+            // repaints the SESSION row.
+            engine.StateChanged += OnEngineStateChanged;
+            try { Icon = AppIcon.For(s.IcoPath, SystemInformation.IconSize.Width); }
+            catch { }
+        }
+
+        void OnEngineStateChanged(object sender, EventArgs e)
+        {
+            if (!IsDisposed) Invalidate();
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                Engine.StateChanged -= OnEngineStateChanged;
+                foreach (Font f in Fonts.Values) f.Dispose();
+                Fonts.Clear();
+                Centered.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+
+        internal void ApplyTheme()
+        {
+            BackColor = Palette.BG;
+            Invalidate();
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            if (m.Msg == Native.WM_NCHITTEST)
+            {
+                int raw = unchecked((int)m.LParam.ToInt64());
+                int x = raw & 0xFFFF;
+                int y = (raw >> 16) & 0xFFFF;
+                if (x > 0x7FFF) x -= 0x10000;
+                if (y > 0x7FFF) y -= 0x10000;
+                Point p = PointToClient(new Point(x, y));
+                if (p.Y < 20 && p.X < Width - 20)
+                    m.Result = (IntPtr)Native.HTCAPTION;
+            }
+        }
+
+        Font F(int pt)
+        {
+            Font f;
+            if (!Fonts.TryGetValue(pt, out f))
+            {
+                f = ProblipForm.MakePixelFont("Verdana", pt);
+                Fonts[pt] = f;
+            }
+            return f;
+        }
+
+        static ProblipForm.HotZone MakeHot(Rectangle r, Action a)
+        {
+            ProblipForm.HotZone h = new ProblipForm.HotZone();
+            h.R = r;
+            h.A = a;
+            return h;
+        }
+
+        void DrawText(Graphics g, string s, int x, int y, Color c, int pt, bool bold = false)
+        {
+            using (var br = new SolidBrush(c))
+                g.DrawString(s, F(pt), br, (float)x, (float)y);
+        }
+
+        void DrawBevel(Graphics g, Rectangle r, bool raised)
+        {
+            Color hi = raised ? Palette.BEVEL : Palette.BDARK;
+            Color lo = raised ? Palette.BDARK : Palette.BEVEL;
+            using (var p1 = new Pen(hi)) g.DrawRectangle(p1, r.X, r.Y, r.Width - 1, r.Height - 1);
+            using (var p2 = new Pen(lo)) g.DrawRectangle(p2, r.X + 1, r.Y + 1, r.Width - 3, r.Height - 3);
+        }
+
+        void DrawButton(Graphics g, Rectangle r, string label, bool selected, int pt = 9)
+        {
+            using (var bg = new SolidBrush(selected ? Palette.COMPARE : Palette.RAISED))
+                g.FillRectangle(bg, r.X + 2, r.Y + 2, r.Width - 4, r.Height - 4);
+            DrawBevel(g, r, !selected);
+            Font f = F(pt);
+            using (var br = new SolidBrush(selected ? Palette.SelectedText : Palette.TEXT))
+                g.DrawString(label, f, br, new RectangleF(r.X + 2, r.Y + 2, r.Width - 4, r.Height - 4), Centered);
+        }
+
+        int TextW(Graphics g, string s, int pt)
+        {
+            return (int)Math.Ceiling(g.MeasureString(s, F(pt)).Width);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.TextRenderingHint = TextRenderingHint.SingleBitPerPixelGridFit;
+            g.SmoothingMode = SmoothingMode.None;
+            g.InterpolationMode = InterpolationMode.NearestNeighbor;
+            g.CompositingQuality = CompositingQuality.HighSpeed;
+            g.Clear(Palette.BG);
+            Hot.Clear();
+
+            using (var b = new SolidBrush(Palette.SURFACE)) g.FillRectangle(b, 0, 0, Width, 20);
+            DrawText(g, "preferences", 8, 4, Palette.TEXT, 12, true);
+            CloseRect = new Rectangle(Width - 20, 0, 20, 20);
+            Hot.Add(MakeHot(CloseRect, delegate() { Hide(); }));
+            DrawText(g, "X", Width - 16, 4, Palette.TEXT2, 12, true);
+
+            // SESSION — periodic blips ON/OFF + one preview TEST.
+            DrawText(g, "SESSION", 8, 32, Palette.TEXT2, 9);
+            int left = 8 + TextW(g, "SESSION", 9) + 14;
+            int pairW = Math.Max(TextW(g, "OFF", 10), TextW(g, "ON", 10)) + 14;
+            bool runOn = Engine.IsOn && !Engine.IsBroken;
+            TestRect = new Rectangle(Width - 8 - (TextW(g, "TEST", 9) + 14), 30, TextW(g, "TEST", 9) + 14, RowH);
+            OffRect = new Rectangle(TestRect.X - 4 - pairW, 30, pairW, RowH);
+            OnRect = new Rectangle(OffRect.X - 4 - pairW, 30, pairW, RowH);
+            Hot.Add(MakeHot(OnRect, delegate() { RequestStart(); }));
+            Hot.Add(MakeHot(OffRect, delegate() { RequestStop(); }));
+            Hot.Add(MakeHot(TestRect, delegate() { Engine.Preview(); Invalidate(); }));
+            DrawButton(g, OnRect, "ON", runOn, 10);
+            DrawButton(g, OffRect, "OFF", !Engine.IsBroken && !Engine.IsOn, 10);
+            DrawButton(g, TestRect, "TEST", false, 9);
+
+            // STARTUP — start with Windows: persisted intent + shared marker.
+            int y = 58;
+            DrawText(g, "STARTUP", 8, y + 4, Palette.TEXT2, 9);
+            bool autoOn = S.AutoStart;
+            AutoStartPaintedLabel = (autoOn ? "[X] start with Windows" : "[ ] start with Windows")
+                + (StartupCommands.ProjectionHealthy ? "" : " !");
+            int autoW = TextW(g, "[X] start with Windows !", 9) + 14;
+            AutoStartRect = new Rectangle(left, y, autoW, RowH);
+            Hot.Add(MakeHot(AutoStartRect, delegate() { ToggleAutostart(); }));
+            DrawButton(g, AutoStartRect, AutoStartPaintedLabel, autoOn, 9);
+
+            // AUDIO — preview after volume change; TEST stays independent.
+            y = 86;
+            DrawText(g, "AUDIO", 8, y + 4, Palette.TEXT2, 9);
+            bool pvOn = S.PreviewOnVolumeChange;
+            string pvLabel = pvOn ? "[X] preview on volume change" : "[ ] preview on volume change";
+            int pvW = TextW(g, pvOn ? "[ ] preview on volume change" : pvLabel, 9) + 14;
+            PreviewRect = new Rectangle(left, y, pvW, RowH);
+            Hot.Add(MakeHot(PreviewRect, delegate() { TogglePreview(); }));
+            DrawButton(g, PreviewRect, pvLabel, pvOn, 9);
+
+            // STATISTICS — recording and counter display are independent.
+            y = 114;
+            DrawText(g, "STATS", 8, y + 4, Palette.TEXT2, 9);
+            bool stOn = S.StatsEnabled;
+            string stLabel = stOn ? "[X] record statistics" : "[ ] record statistics";
+            int stW = TextW(g, "[X] record statistics", 9) + 14;
+            StatsEnabledRect = new Rectangle(left, y, stW, RowH);
+            Hot.Add(MakeHot(StatsEnabledRect, delegate() { ToggleStatsEnabled(); }));
+            DrawButton(g, StatsEnabledRect, stLabel, stOn, 9);
+            bool ctOn = S.ShowBlipCounter;
+            string ctLabel = ctOn ? "[X] show counter" : "[ ] show counter";
+            int ctW = TextW(g, "[X] show counter", 9) + 14;
+            ShowCounterRect = new Rectangle(StatsEnabledRect.Right + 4, y, ctW, RowH);
+            Hot.Add(MakeHot(ShowCounterRect, delegate() { ToggleShowCounter(); }));
+            DrawButton(g, ShowCounterRect, ctLabel, ctOn, 9);
+
+            // VIEW / RESET ALL on the statistics row.
+            y = 142;
+            int viewW = TextW(g, "VIEW", 9) + 14;
+            ViewRect = new Rectangle(left, y, viewW, RowH);
+            Hot.Add(MakeHot(ViewRect, delegate() { Program.ShowStats(S, Engine); }));
+            DrawButton(g, ViewRect, "VIEW", false, 9);
+            int resetW = TextW(g, "[X] RESET ALL", 9) + 14;
+            ResetAllRect = new Rectangle(ViewRect.Right + 4, y, resetW, RowH);
+            Hot.Add(MakeHot(ResetAllRect, delegate() { ResetAll(); }));
+            DrawButton(g, ResetAllRect, "RESET ALL", false, 9);
+
+            // APPEARANCE — glow and always-on-top.
+            y = 170;
+            DrawText(g, "LOOK", 8, y + 4, Palette.TEXT2, 9);
+            bool glowOn = S.BlipGlow;
+            string glowLabel = glowOn ? "[X] glow" : "[ ] glow";
+            int glowW = TextW(g, glowLabel, 9) + 14;
+            GlowRect = new Rectangle(left, y, glowW, RowH);
+            Hot.Add(MakeHot(GlowRect, delegate() { ToggleGlow(); }));
+            DrawButton(g, GlowRect, glowLabel, glowOn, 9);
+            bool topOn = S.AlwaysOnTop;
+            string topLabel = topOn ? "[X] always on top" : "[ ] always on top";
+            int topW = TextW(g, topLabel, 9) + 14;
+            TopRect = new Rectangle(GlowRect.Right + 4, y, topW, RowH);
+            Hot.Add(MakeHot(TopRect, delegate() { ToggleTop(); }));
+            DrawButton(g, TopRect, topLabel, topOn, 9);
+
+            // THEME — name + CHANGE button.
+            y = 196;
+            DrawText(g, "THEME", 8, y + 4, Palette.TEXT2, 9);
+            string themeName = ThemeModel.ById(S.ThemeId).Name;
+            ThemeNameRect = new Rectangle(left, y, Width - left - 8 - (TextW(g, "CHANGE", 9) + 14) - 4, RowH);
+            DrawText(g, Truncate(g, themeName, ThemeNameRect.Width), ThemeNameRect.X + 2, ThemeNameRect.Y + 5, Palette.TEXT, 9, true);
+            ChangeRect = new Rectangle(Width - 8 - (TextW(g, "CHANGE", 9) + 14), y, TextW(g, "CHANGE", 9) + 14, RowH);
+            Hot.Add(MakeHot(ChangeRect, delegate() { Program.ShowThemes(S); }));
+            DrawButton(g, ChangeRect, "CHANGE", false, 9);
+
+            // Failure detail, when there is one.
+            string failure = Engine.FailureText;
+            if (failure != null)
+                DrawText(g, Truncate(g, failure, Width - 16), 8, 224, Palette.DANGERTXT, 9);
+        }
+
+        string Truncate(Graphics g, string s, int maxWidth)
+        {
+            if (TextW(g, s, 9) <= maxWidth) return s;
+            string t = s;
+            while (t.Length > 1 && TextW(g, t + "…", 9) > maxWidth)
+                t = t.Substring(0, t.Length - 1);
+            return t + "…";
+        }
+
+        void RequestStart()
+        {
+            RunState.RequestStart(S, Engine);
+            Program.RefreshPreferenceWindows();
+        }
+
+        void RequestStop()
+        {
+            RunState.RequestStop(S, Engine);
+            Program.RefreshPreferenceWindows();
+        }
+
+        void ToggleAutostart()
+        {
+            AutoStartResult result = StartupCommands.SetAutoStart(S, AutoStartKeyPath, Application.ExecutablePath);
+            if (result != AutoStartResult.Success)
+            {
+                // Preserve the detailed four-state transaction result: the
+                // production message names the real outcome (forward
+                // projection failure, rollback success/failure), never a
+                // generic "Could not save" sentence.
+                NotifySettingsError("autostart", StartupCommands.ResultText(result, S));
+            }
+            Program.RefreshPreferenceWindows();
+            Invalidate();
+        }
+
+        void TogglePreview()
+        {
+            if (!PreferenceCommands.SetPreviewOnVolumeChange(S, !S.PreviewOnVolumeChange, Program.RefreshPreferenceWindows))
+                NotifySettingsError("PreviewOnVolumeChange");
+            Invalidate();
+        }
+
+        void ToggleStatsEnabled()
+        {
+            if (!PreferenceCommands.SetStatsEnabled(S, Engine, !S.StatsEnabled, Program.RefreshPreferenceWindows))
+                NotifySettingsError("StatsEnabled");
+            Invalidate();
+        }
+
+        void ToggleShowCounter()
+        {
+            if (!PreferenceCommands.SetShowBlipCounter(S, !S.ShowBlipCounter, Program.RefreshPreferenceWindows))
+                NotifySettingsError("ShowBlipCounter");
+            Invalidate();
+        }
+
+        void ToggleGlow()
+        {
+            if (!PreferenceCommands.SetBlipGlow(S, !S.BlipGlow, null, Program.RefreshPreferenceWindows))
+                NotifySettingsError("BlipGlow");
+            Invalidate();
+        }
+
+        void ToggleTop()
+        {
+            if (!PreferenceCommands.SetAlwaysOnTop(S, !S.AlwaysOnTop, Program.RefreshPreferenceWindows))
+                NotifySettingsError("AlwaysOnTop");
+            Invalidate();
+        }
+
+        void ResetAll()
+        {
+            if (!PreferenceCommands.ResetAll(Engine, ConfirmResetAll, Program.RefreshPreferenceWindows))
+                NotifySettingsError("ResetAll", ResetAllErrorText());
+            Invalidate();
+        }
+
+        // Same one shared confirmation contract as the Statistics view: tests
+        // swap ProblipForm.ResetConfirmation; production shows the explicit
+        // destructive-action dialog naming Today/Week/Month/Total.
+        static Func<bool> ConfirmResetAll
+        {
+            get { return ProblipForm.ResetConfirmation; }
+        }
+
+        string ResetAllErrorText()
+        {
+            return "Could not reset the statistics.\r\nAll counters keep their previous values.\r\n" + S.IniPath;
+        }
+
+        // The one central cross-surface hook Program wires. Static Action so a
+        // preference command can repaint every open surface after a change.
+        internal static Action RefreshPreferenceWindowsHook = delegate() { Program.RefreshPreferenceWindows(); };
+
+        void NotifySettingsError(string key)
+        {
+            NotifySettingsError(key,
+                "Could not save the " + key + " setting.\r\nThe previous value stays in effect.\r\n" + S.IniPath);
+        }
+
+        // The single reporting seam: tests receive the KEY (the failed
+        // operation, e.g. "ResetAll", "StatsEnabled"); production shows the
+        // SUPPLIED message verbatim, never re-wrapped in a generic sentence.
+        void NotifySettingsError(string key, string message)
+        {
+            if (SettingsErrorSink != null) { SettingsErrorSink(key); return; }
+            MessageBox.Show(this, message, "problip", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button == MouseButtons.Left)
+            {
+                foreach (ProblipForm.HotZone h in Hot)
+                {
+                    if (h.R.Contains(e.Location)) { h.A(); return; }
+                }
+            }
+        }
     }
 
     // Compact custom-painted MANUAL interval editor. One reusable instance is
@@ -2545,7 +3872,7 @@ namespace Problip
             ClientSize = new Size(220, 132);
             BackColor = Palette.BG;
             DoubleBuffered = true;
-            TopMost = true;
+            TopMost = s.AlwaysOnTop;
             PixelFont = ProblipForm.MakePixelFont("Verdana", 11);
             try { Icon = AppIcon.For(s.IcoPath, SystemInformation.IconSize.Width); }
             catch { }
@@ -2854,7 +4181,7 @@ namespace Problip
             ClientSize = new Size(400, RowsTop + RowH * ThemeModel.All.Length + 8);
             BackColor = Palette.BG;
             DoubleBuffered = true;
-            TopMost = true;
+            TopMost = s.AlwaysOnTop;
             try { Icon = AppIcon.For(s.IcoPath, SystemInformation.IconSize.Width); }
             catch { }
         }
@@ -3002,7 +4329,7 @@ namespace Problip
     // clickable BLIPS line. Counts update live through the same BlipPlayed event.
     class StatsForm : Form
     {
-        Settings S;
+        public Settings S;
         BlipEngine Engine;
         List<HotZone> Hot = new List<HotZone>();
         Dictionary<int, Font> Fonts = new Dictionary<int, Font>();
@@ -3013,9 +4340,12 @@ namespace Problip
         // Notifies Program to repaint the (possibly open) main window when the
         // counter visibility changes. Null in unit tests is fine.
         public Action CounterChanged;
+        // Notifies Program when the recording preference changes, so the
+        // open Preferences window repaints through the one central hook.
+        public Action PreferenceChanged;
 
         // Painted hit zones, exposed for the UI layout regression.
-        internal Rectangle CounterRect, CloseRect;
+        internal Rectangle CounterRect, RecordingRect, ResetRect, CloseRect;
         internal Rectangle[] StatRowRects = new Rectangle[4];
 
         class HotZone
@@ -3032,10 +4362,10 @@ namespace Problip
             Text = "problip statistics";
             FormBorderStyle = FormBorderStyle.None;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(240, 190);
+            ClientSize = new Size(240, 234);
             BackColor = Palette.BG;
             DoubleBuffered = true;
-            TopMost = true;
+            TopMost = s.AlwaysOnTop;
             Engine.BlipPlayed += OnBlipPlayed;
             try { Icon = AppIcon.For(s.IcoPath, SystemInformation.IconSize.Width); }
             catch { }
@@ -3152,14 +4482,29 @@ namespace Problip
                 y += 22;
             }
 
+            string recordingLabel = S.StatsEnabled ? "[X] record statistics" : "[ ] record statistics";
+            int recordingW = TextW(g, recordingLabel, 10) + 14;
+            RecordingRect = new Rectangle(8, y + 6, recordingW, 22);
+            Hot.Add(MakeHot(RecordingRect, delegate() { ToggleRecording(); }));
+            DrawButton(g, RecordingRect, recordingLabel, S.StatsEnabled);
+
             string counterLabel = S.ShowBlipCounter ? "[X] show counter" : "[ ] show counter";
             int cw = TextW(g, counterLabel, 10) + 14;
-            CounterRect = new Rectangle(8, y + 6, cw, 22);
+            CounterRect = new Rectangle(8, y + 34, cw, 22);
             Hot.Add(MakeHot(CounterRect, delegate() { ToggleShowCounter(); }));
             DrawButton(g, CounterRect, counterLabel, S.ShowBlipCounter);
 
+            int resetW = TextW(g, "RESET ALL", 10) + 24;
+            ResetRect = new Rectangle(8, y + 62, resetW, 22);
+            Hot.Add(MakeHot(ResetRect, delegate() {
+                if (!PreferenceCommands.ResetAll(Engine, ProblipForm.ResetConfirmation, PreferenceChanged))
+                    NotifySettingsError("ResetAll", ResetAllErrorText());
+                Invalidate();
+            }));
+            DrawButton(g, ResetRect, "RESET ALL", false);
+
             int closeW = TextW(g, "CLOSE", 10) + 24;
-            CloseRect = new Rectangle(Width - 8 - closeW, y + 34, closeW, 22);
+            CloseRect = new Rectangle(Width - 8 - closeW, y + 62, closeW, 22);
             Hot.Add(MakeHot(CloseRect, delegate() { Hide(); }));
             DrawButton(g, CloseRect, "CLOSE", false);
         }
@@ -3170,30 +4515,61 @@ namespace Problip
         // This is application state, never statistics state.
         internal void ToggleShowCounter()
         {
-            bool previous = S.ShowBlipCounter;
-            bool next = !previous;
-            S.ShowBlipCounter = next;
-            try
+            if (!PreferenceCommands.SetShowBlipCounter(S, !S.ShowBlipCounter, CounterChanged))
             {
-                S.Save("ShowBlipCounter", next ? "1" : "0");
-            }
-            catch (System.IO.IOException)
-            {
-                S.ShowBlipCounter = previous;
-                NotifySettingsError();
+                NotifySettingsError("ShowBlipCounter");
                 Invalidate();
                 return;
             }
-            if (CounterChanged != null) CounterChanged();
             Invalidate();
         }
 
-        void NotifySettingsError()
+        // Shared recording toggle: persists through the one preference seam and
+        // announces success only on a landed write (a failed save announces
+        // nothing cross-surface and keeps the previous value).
+        internal void ToggleRecording()
         {
-            if (SettingsErrorSink != null) { SettingsErrorSink("ShowBlipCounter"); return; }
-            MessageBox.Show(this,
-                "Could not save the show-counter setting.\r\nThe previous value stays in effect.\r\n" + S.IniPath,
-                "problip", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            if (!PreferenceCommands.SetStatsEnabled(S, Engine, !S.StatsEnabled, PreferenceChanged))
+            {
+                NotifySettingsError("StatsEnabled");
+                Invalidate();
+                return;
+            }
+            Invalidate();
+        }
+
+        // The one reporting seam, keyed by the ACTUAL failed operation — never
+        // a hard-coded "ShowBlipCounter" for every failure. Tests receive the
+        // key (ShowBlipCounter / StatsEnabled / ResetAll); production shows a
+        // message naming the operation.
+        void NotifySettingsError(string key)
+        {
+            string message;
+            switch (key)
+            {
+                case "StatsEnabled":
+                    message = "Could not save the record-statistics setting.\r\nThe previous value stays in effect.\r\n" + S.IniPath;
+                    break;
+                case "ResetAll":
+                    message = ResetAllErrorText();
+                    break;
+                default:
+                    message = "Could not save the show-counter setting.\r\nThe previous value stays in effect.\r\n" + S.IniPath;
+                    break;
+            }
+            if (SettingsErrorSink != null) { SettingsErrorSink(key); return; }
+            MessageBox.Show(this, message, "problip", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+
+        void NotifySettingsError(string key, string message)
+        {
+            if (SettingsErrorSink != null) { SettingsErrorSink(key); return; }
+            MessageBox.Show(this, message, "problip", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+
+        string ResetAllErrorText()
+        {
+            return "Could not reset the statistics.\r\nAll counters keep their previous values.\r\n" + S.IniPath;
         }
 
         protected override void OnMouseDown(MouseEventArgs e)
@@ -3325,7 +4701,7 @@ namespace Problip
             ClientSize = new Size(460, 430);
             BackColor = Palette.BG;
             DoubleBuffered = true;
-            TopMost = true;
+            TopMost = s.AlwaysOnTop;
             ShowInTaskbar = false;
             try { Icon = AppIcon.For(s.IcoPath, SystemInformation.IconSize.Width); }
             catch { }
@@ -3448,19 +4824,19 @@ namespace Problip
         static ManualIntervalForm _manualForm;
         static ThemesForm _themesForm;
         static HelpForm _helpForm;
+        static PreferencesForm _prefsForm;
 
         [STAThread]
         static void Main()
         {
-            bool createdNew;
-            using (var mutex = new System.Threading.Mutex(true, "Local\\ProblipApp", out createdNew))
+            string dir = AppDomain.CurrentDomain.BaseDirectory;
+            PersistenceOwnership ownership;
+            if (!PersistenceOwnership.TryAcquire(dir, out ownership)) return;
+            using (ownership)
             {
-                if (!createdNew) return;
-
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
 
-                string dir = AppDomain.CurrentDomain.BaseDirectory;
                 Settings s = new Settings(dir);
                 s.Load();
 
@@ -3488,6 +4864,8 @@ namespace Problip
                 menu.Items.Add("Themes", null, delegate(object o, EventArgs e) { ShowThemes(s); });
                 // Same single Help window as the title-bar "?" and F1.
                 menu.Items.Add("Help", null, delegate(object o, EventArgs e) { ShowHelp(s); });
+                // Same single Preferences window as the main PREFS row.
+                menu.Items.Add("Preferences", null, delegate(object o, EventArgs e) { ShowPreferences(s, engine); });
                 menu.Items.Add(new ToolStripSeparator());
                 // Preview is stateless: it never flips ON/OFF, never re-arms the
                 // pending wait. A failed preview surfaces through the existing
@@ -3507,6 +4885,7 @@ namespace Problip
                     if (_manualForm != null) { try { _manualForm.Dispose(); } catch { } _manualForm = null; }
                     if (_themesForm != null) { try { _themesForm.Dispose(); } catch { } _themesForm = null; }
                     if (_helpForm != null) { try { _helpForm.Dispose(); } catch { } _helpForm = null; }
+                    if (_prefsForm != null) { try { _prefsForm.Dispose(); } catch { } _prefsForm = null; }
                     tray.Visible = false;
                     Application.Exit();
                 });
@@ -3532,13 +4911,10 @@ namespace Problip
                 onState(null, EventArgs.Empty);
 
                 // always fix the autostart entry on every boot: the INI is the
-                // authority, the Run key is its projection.
-                try
-                {
-                    if (s.AutoStart) AutoStart.Set(AutoStart.RunKeyPath, Application.ExecutablePath);
-                    else AutoStart.Clear(AutoStart.RunKeyPath);
-                }
-                catch { }
+                // authority, the Run key is its projectioncolon. A projection
+                // failure degrades the session health flag and leaves the
+                // persisted intent intact for a later repair.
+                StartupCommands.ProjectAtStartup(s, AutoStart.RunKeyPath, Application.ExecutablePath);
 
                 Application.Run();
                 engine.Cleanup();
@@ -3546,6 +4922,7 @@ namespace Problip
                 if (_manualForm != null) { try { _manualForm.Dispose(); } catch { } _manualForm = null; }
                 if (_themesForm != null) { try { _themesForm.Dispose(); } catch { } _themesForm = null; }
                 if (_helpForm != null) { try { _helpForm.Dispose(); } catch { } _helpForm = null; }
+                if (_prefsForm != null) { try { _prefsForm.Dispose(); } catch { } _prefsForm = null; }
                 if (menu != null) menu.Dispose();
                 if (tray != null)
                 {
@@ -3580,6 +4957,7 @@ namespace Problip
                 // The title-bar "?" (and F1, and the tray Help item) opens the
                 // one reusable Help window.
                 _form.OpenHelp = delegate() { ShowHelp(s); };
+                _form.OpenPreferences = delegate() { ShowPreferences(s, engine); };
                 _form.FormClosing += delegate(object o, FormClosingEventArgs e)
                 {
                     if (e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; _form.Hide(); }
@@ -3590,7 +4968,7 @@ namespace Problip
         }        // One live theme picker, owned like the statistics view: both the tray
         // Themes item and the settings window's THEME line open the SAME
         // instance. The switch transaction itself is ApplyThemeId below.
-        static void ShowThemes(Settings s)
+        internal static void ShowThemes(Settings s)
         {
             if (_themesForm == null || _themesForm.IsDisposed)
             {
@@ -3685,7 +5063,7 @@ namespace Problip
 
         // One live statistics instance, owned like the settings window: a second
         // open reuses and activates it, never duplicates it.
-        static void ShowStats(Settings s, BlipEngine engine)
+        internal static void ShowStats(Settings s, BlipEngine engine)
         {
             if (_statsForm == null || _statsForm.IsDisposed)
             {
@@ -3693,7 +5071,9 @@ namespace Problip
                 _statsForm.CounterChanged = delegate()
                 {
                     if (_form != null && !_form.IsDisposed) _form.Invalidate();
+                    RefreshPreferenceWindows();
                 };
+                _statsForm.PreferenceChanged = delegate() { RefreshPreferenceWindows(); };
                 _statsForm.FormClosing += delegate(object o, FormClosingEventArgs e)
                 {
                     if (e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; _statsForm.Hide(); }
@@ -3701,6 +5081,57 @@ namespace Problip
             }
             _statsForm.Show();
             _statsForm.Activate();
+        }
+
+        // One live Preferences / Control Center. Reuses and activates the same
+        // form; opening it is not a scheduling or audio event.
+        internal static void ShowPreferences(Settings s, BlipEngine engine)
+        {
+            if (_prefsForm == null || _prefsForm.IsDisposed)
+            {
+                _prefsForm = new PreferencesForm(s, engine);
+                _prefsForm.FormClosing += delegate(object o, FormClosingEventArgs e)
+                {
+                    if (e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; _prefsForm.Hide(); }
+                };
+            }
+            _prefsForm.Show();
+            _prefsForm.Activate();
+        }
+
+        // Live always-on-top projection. Called on creation and on every
+        // AlwaysOnTop preference change; paint never queries the preference.
+        internal static void ApplyAlwaysOnTopToWindows()
+        {
+            if (_form != null && !_form.IsDisposed) ApplyAlwaysOnTop(_form);
+            if (_statsForm != null && !_statsForm.IsDisposed) ApplyAlwaysOnTop(_statsForm);
+            if (_manualForm != null && !_manualForm.IsDisposed) ApplyAlwaysOnTop(_manualForm);
+            if (_themesForm != null && !_themesForm.IsDisposed) ApplyAlwaysOnTop(_themesForm);
+            if (_helpForm != null && !_helpForm.IsDisposed) ApplyAlwaysOnTop(_helpForm);
+            if (_prefsForm != null && !_prefsForm.IsDisposed) ApplyAlwaysOnTop(_prefsForm);
+        }
+
+        static void ApplyAlwaysOnTop(Form f)
+        {
+            try { f.TopMost = SettingsForTopMost() != null && SettingsForTopMost().AlwaysOnTop; }
+            catch { }
+        }
+
+        static Settings SettingsForTopMost()
+        {
+            if (_form != null && !_form.IsDisposed && _form.S != null) return _form.S;
+            if (_prefsForm != null && !_prefsForm.IsDisposed && _prefsForm.S != null) return _prefsForm.S;
+            if (_statsForm != null && !_statsForm.IsDisposed && _statsForm.S != null) return _statsForm.S;
+            return null;
+        }
+
+        // The one cross-surface repaint hook every preference command calls.
+        // Invalidates the three preference surfaces; audio keeps running.
+        internal static void RefreshPreferenceWindows()
+        {
+            try { if (_form != null && !_form.IsDisposed) _form.Invalidate(); } catch { }
+            try { if (_statsForm != null && !_statsForm.IsDisposed) _statsForm.Invalidate(); } catch { }
+            try { if (_prefsForm != null && !_prefsForm.IsDisposed) _prefsForm.Invalidate(); } catch { }
         }
     }
 }

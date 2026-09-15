@@ -125,6 +125,38 @@ and toggle ON/OFF.
   ON/OFF still applies for the running session).
 - **Tray Start / Stop** — the same commands; availability follows the state
   (ON: Start disabled; OFF/ERR: Start enabled — the recovery action).
+- **PREFS** — the small utility row under the bottom row opens the Preferences /
+  Control Center (the tray **Preferences** item opens the same window).
+
+## Preferences / Control Center
+
+One reusable window (main **PREFS** row or tray **Preferences**) groups every
+behavioral switch the product has. Each control routes through one shared
+command seam, so the same setting changed from another surface stays in sync
+with no polling and no restart:
+
+- **SESSION — periodic blips ON/OFF** — the shared Start/Stop command: the
+  choice is remembered (`RunOnLaunch`) and mirrors the main window, the tray and
+  the real engine state (ERR selects neither and keeps ON available as the
+  recovery action).
+- **STARTUP — start with Windows** — the same verified registry + INI
+  transaction as the main window's autostart toggle. Separate from
+  `RunOnLaunch`: AutoStart decides whether Windows launches PROBLIP at all,
+  `RunOnLaunch` decides whether periodic blips run once it does.
+- **AUDIO — preview after volume change** — off means a volume change still
+  applies (and rebuilds the scaled sound) but stays silent. **TEST** is
+  independent and always plays one preview; it never changes ON/OFF, the pending
+  countdown, the PULSE phase, the statistics or the glow.
+- **STATISTICS — record statistics / show BLIPS counter** — two independent
+  preferences. Recording off stops future counting only: history stays,
+  audio keeps running, Glow keeps working and a visible frozen total is marked
+  `OFF`. Hiding the counter hides only the display; counting continues.
+  **VIEW** opens the Statistics window; **RESET ALL** runs the shared atomic
+  reset (confirmation required; cancelled or failed resets change nothing).
+- **APPEARANCE — blip glow / always on top / theme CHANGE** — glow can be
+  switched off at any time (an active glow stops immediately); always-on-top
+  applies live to every PROBLIP window; **CHANGE** opens the same Themes window
+  the main **THEME** row uses, and the current theme name updates immediately.
 
 ## Portable configuration
 
@@ -141,8 +173,11 @@ ManualToSec=7
 AutoStart=0
 RunOnLaunch=1
 ShowBlipCounter=1
+StatsEnabled=1
+PreviewOnVolumeChange=1
 ThemeId=theme_classic
 BlipGlow=1
+AlwaysOnTop=1
 ```
 
 `IntervalKind` selects the active mode: `range` uses the ordinary
@@ -154,7 +189,11 @@ built-in 5 s / random 10–20 s pattern. An old `problip.ini` without
 `ThemeId` is the selected theme (see the list in Features). An old ini
 without the key, an unknown value or the removed `theme_wintage_custom` all
 resolve to `theme_classic`. `BlipGlow` is the glow preference; anything but
-an exact `0` means on.
+an exact `0` means on. `StatsEnabled` controls whether successful scheduled
+blips are recorded (anything but an exact `0` means on); `PreviewOnVolumeChange`
+controls the preview after a volume change (anything but an exact `0` means on);
+`AlwaysOnTop` controls whether PROBLIP windows stay above other windows
+(anything but an exact `0` means on).
 
 `problip.ini` is **user state** — it is not part of the source tree and is never
 packaged in a release. `problip.example.ini` shows the safe defaults.
@@ -169,11 +208,20 @@ changing any counter.
 - **Today** follows the local calendar date.
 - **This week** is the ISO week (Monday–Sunday).
 - **This month** follows the local calendar month.
-- **Total** never resets.
+- **Total** never resets — except by an explicit **RESET ALL**.
 - A new period starts at 1 on its first blip; before that, a stale period shows
   0 (no midnight timer, no background work).
 - Counters saturate safely and can never go negative.
 - Hiding the `BLIPS` line only hides the display — counting continues.
+- **Record statistics** (`StatsEnabled`) can be paused from the Statistics view
+  or Preferences: pausing stops future counting, keeps all existing counters and
+  never touches audio, the glow or the counter visibility; a visible frozen
+  total is marked `OFF`. Re-enabling simply counts the next successful scheduled
+  blip — no backfill, no estimates.
+- **RESET ALL** (Statistics view or Preferences) zeroes all four counters in one
+  atomic transaction after an explicit confirmation. A failed commit changes
+  neither memory nor disk and is reported once; the schedule, audio and glow are
+  never affected. The next successful recorded blip starts at 1.
 
 Statistics are stored locally in `problip.stats.ini` beside the executable,
 separate from `problip.ini`. There is no account, no server and no telemetry;
@@ -245,6 +293,11 @@ reflection, and exits non-zero if any harness fails. Individual harnesses
   `problip.stats.ini` persistence contract, and the atomic snapshot commit
   (a failed replacement leaves the previous complete snapshot on disk; failed
   flushes retry on the bounded 10-second attempt window, never per blip).
+- `test_preferences.ps1` — the Preferences / Control Center wave: the three new
+  settings' defaults and round-trips, statistics recording vs display
+  independence, the atomic + failed-reset contracts, preview-on-volume behavior,
+  always-on-top live projection, read-only preference-failure rollback, and
+  cross-window live synchronization.
 - `test_package.ps1` — release ZIP content contract; packaging fails closed
   when a mandatory runtime asset is missing.
 

@@ -325,7 +325,86 @@ try {
         Check 'a theme switch leaves the PULSE phase untouched' ((& $phaseOf $eT) -eq $phaseT)
     }
 
+    # ---- W2-002: failed interval persistence must preserve NextDueMs/Pulse ----
+    # Engine ON, interval transaction fails, NextDueMs/Timer.Interval/Kind/manual
+    # bounds/PulseShortNext must remain exactly as before. Proves no scheduling
+    # leak through a rejected INI transaction. Driven through the real
+    # ProblipForm.ApplyRange/ApplyManual/ApplyPulse seams.
+    $formTypeI = $asm.GetType('Problip.ProblipForm', $true)
+    $applyRangeI = $formTypeI.GetMethod('ApplyRange', $flags)
+    $applyManualI = $formTypeI.GetMethod('ApplyManual', $flags)
+    $applyPulseI = $formTypeI.GetMethod('ApplyPulse', $flags)
+    $sinkFieldI = $formTypeI.GetField('SettingsErrorSink', $flags)
+    $commitIntF = $settingsType.GetField('CommitIntervalFile', $flags)
+    $formsI = @(); $traysI = @()
+    function Test-FailedIntervalPreservesSchedule([string]$name, [scriptblock]$applyFail) {
+        $d = Join-Path $work ("w2_sched_" + [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $d | Out-Null
+        $s = $settingsCtor.Invoke(@([string]$d))
+        $loadMethod.Invoke($s, @()) | Out-Null
+        $s.WavPath = [string]$wav
+        $s.Volume = 0.0
+        $e = $engineCtor.Invoke(@($s))
+        $script:fakeNow = [long]0
+        $nowMsField.SetValue($e, [Func[long]]{ param() $script:fakeNow })
+        $st = $statsField.GetValue($e)
+        $statsNowField.SetValue($st, [Func[long]]{ param() $script:fakeNow })
+        $statsLocalNowField.SetValue($st, [Func[datetime]]{ param() $statsDay })
+        $playerField.SetValue($e, (New-Object System.Media.SoundPlayer $wav))
+        $tray = New-Object System.Windows.Forms.NotifyIcon
+        $form = $formTypeI.GetConstructors($flags)[0].Invoke([object[]]@($s, $e, [System.Windows.Forms.NotifyIcon]$tray))
+        $sinkFieldI.SetValue($form, ([System.Action[string]]{ param($k) }))
+        $script:formsI += $form; $script:traysI += $tray
+        $setIntervalM.Invoke($e, @($kindRange, 4000, 7000))
+        $e.Start()
+        $script:fakeNow = 1000
+        $beforeDue = [long]$nextDueField.GetValue($e)
+        $beforeInterval = [double]($timerOf.Invoke($e)).Interval
+        $beforeKind = $kindField.GetValue($e)
+        $beforeManualMin = [long]$manualMinField.GetValue($e)
+        $beforeManualMax = [long]$manualMaxField.GetValue($e)
+        $beforePhase = [bool]$pulsePhaseField.GetValue($e)
+        & $applyFail $form $s $d
+        Check "W2-002 $name`: NextDueMs preserved exactly" ([long]$nextDueField.GetValue($e) -eq $beforeDue) `
+            "before=$beforeDue after=$([long]$nextDueField.GetValue($e))"
+        Check "W2-002 $name`: Timer.Interval preserved exactly" ([double]($timerOf.Invoke($e)).Interval -eq $beforeInterval) `
+            "before=$beforeInterval after=$([double]($timerOf.Invoke($e)).Interval)"
+        Check "W2-002 $name`: Kind preserved" ($kindField.GetValue($e) -eq $beforeKind)
+        Check "W2-002 $name`: ManualMinMs preserved" ([long]$manualMinField.GetValue($e) -eq $beforeManualMin)
+        Check "W2-002 $name`: ManualMaxMs preserved" ([long]$manualMaxField.GetValue($e) -eq $beforeManualMax)
+        Check "W2-002 $name`: PulseShortNext preserved" ([bool]$pulsePhaseField.GetValue($e) -eq $beforePhase)
+    }
+
+    # Range failure: sabotaged commit (original 4..7, attempt 10..15)
+    Test-FailedIntervalPreservesSchedule 'range' {
+        param($form, $s, $d)
+        $commitIntF.SetValue($s, [Func[string,string,bool]]{ param($t, $p)
+            try { if (Test-Path -LiteralPath $t) { Remove-Item -LiteralPath $t -Force -ErrorAction SilentlyContinue } } catch { }
+            return $false })
+        $applyRangeI.Invoke($form, @(10000, 15000)) | Out-Null
+    }
+
+    # Manual failure: sabotaged commit (original Range 4..7, attempt Manual 2..4)
+    Test-FailedIntervalPreservesSchedule 'manual' {
+        param($form, $s, $d)
+        $commitIntF.SetValue($s, [Func[string,string,bool]]{ param($t, $p)
+            try { if (Test-Path -LiteralPath $t) { Remove-Item -LiteralPath $t -Force -ErrorAction SilentlyContinue } } catch { }
+            return $false })
+        [void]$applyManualI.Invoke($form, @(2, 4))
+    }
+
+    # Pulse failure: sabotaged commit (original Range 4..7)
+    Test-FailedIntervalPreservesSchedule 'pulse' {
+        param($form, $s, $d)
+        $commitIntF.SetValue($s, [Func[string,string,bool]]{ param($t, $p)
+            try { if (Test-Path -LiteralPath $t) { Remove-Item -LiteralPath $t -Force -ErrorAction SilentlyContinue } } catch { }
+            return $false })
+        $applyPulseI.Invoke($form, @()) | Out-Null
+    }
+
 } finally {
+    foreach ($f in $script:formsI) { try { $f.Dispose() } catch { } }
+    foreach ($t in $script:traysI) { try { $t.Dispose() } catch { } }
     foreach ($e in $engines) { try { $e.Cleanup() } catch { } }
     if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
 }

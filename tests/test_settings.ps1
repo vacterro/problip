@@ -150,6 +150,18 @@ namespace Problip {
             Set-Content -LiteralPath (Join-Path $dir 'problip.ini') -Value $sb.ToString() -NoNewline
         }
         $s.Load()
+        # W2-002: interval transactions no longer route through Save(); they use
+        # the IntervalWrite candidate seam. Bridge FailKeys onto that seam so
+        # the same key-based fault injection keeps working for interval cases.
+        if ($failKeys -and $failKeys.Count -gt 0) {
+            $fk = [System.Collections.Generic.List[string]]$failKeys
+            $iwField = $type.GetField('IntervalWrite', $flags)
+            $origIW = $iwField.GetValue($s)
+            $wrap = { param($path, $key, $val)
+                if ($fk.Contains($key)) { return $false }
+                return $origIW.Invoke($path, $key, $val) }.GetNewClosure()
+            $iwField.SetValue($s, [Func[string,string,string,bool]]$wrap)
+        }
         return $s
     }
 
@@ -525,6 +537,246 @@ namespace Problip {
     $ini35 = Get-Content -LiteralPath (Join-Path $fresh35 'problip.ini') -Raw
     Check 'a fresh INI stores ThemeId=theme_classic and BlipGlow=1' `
         ($ini35 -match 'ThemeId=theme_classic' -and $ini35 -match 'BlipGlow=1') $ini35.Trim()
+
+    # ---- W2-002: failure-atomic interval transaction ----
+    # SaveIntervalState is no longer rollback-based: a sibling candidate is
+    # prepared, verified, and atomically committed. Every failure point must
+    # leave the ORIGINAL problip.ini byte-for-byte unchanged, produce no temp
+    # artifact, and preserve Settings/Engine/scheduling state exactly.
+    $intervalWriteF = $type.GetField('IntervalWrite', $flags)
+    $commitIntF = $type.GetField('CommitIntervalFile', $flags)
+    $saveIntervalM = $type.GetMethod('SaveIntervalState')
+    $tempOf = { param($d) Join-Path $d 'problip.ini.interval.tmp' }
+    $origIW = $intervalWriteF.GetValue($ctor.Invoke(@([string]$work)))   # default production delegate
+
+    # A helper that runs one interval transaction with an injected fault and
+    # asserts the full W2-002 postcondition set.
+    function Test-AtomicFailure([string]$name, [string[]]$failKeys, [bool]$failCommit, [hashtable]$seed, [scriptblock]$apply, [ref]$retRef) {
+        $d = Join-Path $work ('w2_' + [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $d | Out-Null
+        if ($seed) {
+            $sb = New-Object Text.StringBuilder("[problip]`r`n")
+            foreach ($k in $seed.Keys) { [void]$sb.AppendLine("$k=$($seed[$k])") }
+            Set-Content -LiteralPath (Join-Path $d 'problip.ini') -Value $sb.ToString() -NoNewline
+        }
+        $s = $ctor.Invoke(@([string]$d)); $s.Load()
+        $iniPath = Join-Path $d 'problip.ini'
+        $bytesBefore = if (Test-Path -LiteralPath $iniPath) { [IO.File]::ReadAllBytes($iniPath) } else { $null }
+        # inject preparation fault(s)
+        if ($failKeys) {
+            $fkList = [System.Collections.Generic.List[string]]$failKeys
+            $defIW = $intervalWriteF.GetValue($s)
+            $w = { param($path, $key, $val)
+                if ($fkList.Contains($key)) { return $false }
+                return $defIW.Invoke($path, $key, $val) }.GetNewClosure()
+            $intervalWriteF.SetValue($s, [Func[string,string,string,bool]]$w)
+        }
+        # inject commit fault
+        if ($failCommit) {
+            $commitIntF.SetValue($s, [Func[string,string,bool]]{ param($t, $p)
+                try { if (Test-Path -LiteralPath $t) { Remove-Item -LiteralPath $t -Force -ErrorAction SilentlyContinue } } catch { }
+                return $false })
+        }
+        $ret = [bool]$apply.Invoke($s)
+        $retRef.Value = $ret
+        $bytesAfter = if (Test-Path -LiteralPath $iniPath) { [IO.File]::ReadAllBytes($iniPath) } else { $null }
+        $sameBytes = if ($null -eq $bytesBefore) { ($null -eq $bytesAfter -or $bytesAfter.Length -eq 0 -and $bytesBefore -eq $null) } else { ([Convert]::ToBase64String($bytesBefore) -eq [Convert]::ToBase64String($bytesAfter)) }
+        # missing original file case: byte equality is "still does not exist"
+        if ($null -eq $bytesBefore) { $sameBytes = -not (Test-Path -LiteralPath $iniPath) }
+        $tmpGone = -not (Test-Path -LiteralPath (& $tempOf $d))
+        return @{ SameBytes = $sameBytes; TmpGone = $tmpGone; Dir = $d; S = $s }
+    }
+
+    # RANGE failure matrix (A: first key, B: middle key, C: last key, D: commit)
+    $rangeNext = {
+        param($s)
+        $kvType = [System.Collections.Generic.KeyValuePair[string,string]]
+        $next = @(
+            [System.Collections.Generic.KeyValuePair[string,string]]::new('IntervalKind', 'range'),
+            [System.Collections.Generic.KeyValuePair[string,string]]::new('MinMs', '10000'),
+            [System.Collections.Generic.KeyValuePair[string,string]]::new('MaxMs', '15000')
+        )
+        $prev = @(
+            [System.Collections.Generic.KeyValuePair[string,string]]::new('IntervalKind', 'range'),
+            [System.Collections.Generic.KeyValuePair[string,string]]::new('MinMs', '4000'),
+            [System.Collections.Generic.KeyValuePair[string,string]]::new('MaxMs', '7000')
+        )
+        return $s.SaveIntervalState($next, $prev)
+    }
+    foreach ($case in @(
+        @{ N='A'; Keys=@('IntervalKind'); Commit=$false },
+        @{ N='B'; Keys=@('MinMs');     Commit=$false },
+        @{ N='C'; Keys=@('MaxMs');     Commit=$false },
+        @{ N='D'; Keys=$null;          Commit=$true }
+    )) {
+        $retRef = [ref]$false
+        $r = Test-AtomicFailure "range-$($case.N)" $case.Keys $case.Commit @{ IntervalKind='range'; MinMs='4000'; MaxMs='7000' } $rangeNext $retRef
+        Check "W2-002 range $($case.N): rejected transaction returns false" (-not $retRef.Value)
+        Check "W2-002 range $($case.N): original INI byte-for-byte unchanged" $r.SameBytes
+        Check "W2-002 range $($case.N): no temp artifact survives" $r.TmpGone
+        Check "W2-002 range $($case.N): Settings unchanged" ($r.S.MinMs -eq 4000 -and $r.S.MaxMs -eq 7000) "min=$($r.S.MinMs) max=$($r.S.MaxMs)"
+    }
+
+    # Restart after rejected transaction: fresh Settings.Load must see the OLD interval.
+    $retRefR = [ref]$false
+    $rR = Test-AtomicFailure 'range-restart' @('MaxMs') $false @{ IntervalKind='range'; MinMs='4000'; MaxMs='7000' } $rangeNext $retRefR
+    $sFresh = $ctor.Invoke(@([string]$rR.Dir)); $sFresh.Load()
+    Check 'W2-002 restart after rejected range: fresh Load keeps the old interval' `
+        ($sFresh.MinMs -eq 4000 -and $sFresh.MaxMs -eq 7000 -and $sFresh.Kind -eq $kindRange) `
+        "min=$($sFresh.MinMs) max=$($sFresh.MaxMs) kind=$($sFresh.Kind)"
+
+    # MANUAL failure matrix (E/F/G/H)
+    $manualNext = {
+        param($s)
+        $next = @(
+            [System.Collections.Generic.KeyValuePair[string,string]]::new('ManualFromSec', '60'),
+            [System.Collections.Generic.KeyValuePair[string,string]]::new('ManualToSec', '90'),
+            [System.Collections.Generic.KeyValuePair[string,string]]::new('IntervalKind', 'manual')
+        )
+        $prev = @(
+            [System.Collections.Generic.KeyValuePair[string,string]]::new('ManualFromSec', '4'),
+            [System.Collections.Generic.KeyValuePair[string,string]]::new('ManualToSec', '7'),
+            [System.Collections.Generic.KeyValuePair[string,string]]::new('IntervalKind', 'range')
+        )
+        return $s.SaveIntervalState($next, $prev)
+    }
+    foreach ($case in @(
+        @{ N='E'; Keys=@('ManualFromSec'); Commit=$false },
+        @{ N='F'; Keys=@('ManualToSec');   Commit=$false },
+        @{ N='G'; Keys=@('IntervalKind');  Commit=$false },
+        @{ N='H'; Keys=$null;              Commit=$true }
+    )) {
+        $retRefM = [ref]$false
+        $rM = Test-AtomicFailure "manual-$($case.N)" $case.Keys $case.Commit @{ IntervalKind='range'; MinMs='4000'; MaxMs='7000'; ManualFromSec='4'; ManualToSec='7' } $manualNext $retRefM
+        Check "W2-002 manual $($case.N): rejected transaction returns false" (-not $retRefM.Value)
+        Check "W2-002 manual $($case.N): original INI byte-for-byte unchanged" $rM.SameBytes
+        Check "W2-002 manual $($case.N): no temp artifact survives" $rM.TmpGone
+    }
+    # Restart after rejected manual transaction: no new ManualFromSec + old kind.
+    $retRefM2 = [ref]$false
+    $rM2 = Test-AtomicFailure 'manual-restart' @('ManualToSec') $false @{ IntervalKind='range'; MinMs='4000'; MaxMs='7000'; ManualFromSec='4'; ManualToSec='7' } $manualNext $retRefM2
+    $sM2 = $ctor.Invoke(@([string]$rM2.Dir)); $sM2.Load()
+    Check 'W2-002 restart after rejected manual: fresh Load keeps the old bounds and kind' `
+        ([int]$fromField.GetValue($sM2) -eq 4 -and [int]$toField.GetValue($sM2) -eq 7 -and $sM2.Kind -eq $kindRange) `
+        "from=$([int]$fromField.GetValue($sM2)) to=$([int]$toField.GetValue($sM2)) kind=$($sM2.Kind)"
+
+    # Candidate verification failure: write claims success but readback does not
+    # contain the expected value. Inject a lying IntervalWrite that reports true
+    # but writes a different value.
+    $dV = Join-Path $work ('w2_' + [Guid]::NewGuid().ToString('N')); New-Item -ItemType Directory -Path $dV | Out-Null
+    Set-Content -LiteralPath (Join-Path $dV 'problip.ini') -NoNewline -Value "[problip]`r`nIntervalKind=range`r`nMinMs=4000`r`nMaxMs=7000`r`n"
+    $sV = $ctor.Invoke(@([string]$dV)); $sV.Load()
+    $bytesV0 = [IO.File]::ReadAllBytes((Join-Path $dV 'problip.ini'))
+    $realIW = $intervalWriteF.GetValue($sV)
+    $intervalWriteF.SetValue($sV, [Func[string,string,string,bool]]{ param($path, $key, $val)
+        if ($key -eq 'MaxMs') { return $true }   # lie: claims success, writes nothing
+        return $realIW.Invoke($path, $key, $val) }.GetNewClosure())
+    $retV = [bool]$rangeNext.Invoke($sV)
+    $bytesV1 = [IO.File]::ReadAllBytes((Join-Path $dV 'problip.ini'))
+    Check 'W2-002 candidate verification failure returns false' (-not $retV)
+    Check 'W2-002 candidate verification failure leaves original unchanged' ([Convert]::ToBase64String($bytesV0) -eq [Convert]::ToBase64String($bytesV1))
+    Check 'W2-002 candidate verification failure cleans the temp' (-not (Test-Path -LiteralPath (& $tempOf $dV)))
+
+    # Successful RANGE restart: 4..7 -> 10..15, fresh Load sees exactly that.
+    $dS = Join-Path $work ('w2_' + [Guid]::NewGuid().ToString('N')); New-Item -ItemType Directory -Path $dS | Out-Null
+    Set-Content -LiteralPath (Join-Path $dS 'problip.ini') -NoNewline -Value "[problip]`r`nIntervalKind=range`r`nMinMs=4000`r`nMaxMs=7000`r`n"
+    $sS = $ctor.Invoke(@([string]$dS)); $sS.Load()
+    $retS = [bool]$rangeNext.Invoke($sS)
+    Check 'W2-002 successful range transaction returns true' $retS
+    Check 'W2-002 successful range transaction leaves no temp' (-not (Test-Path -LiteralPath (& $tempOf $dS)))
+    $sS2 = $ctor.Invoke(@([string]$dS)); $sS2.Load()
+    Check 'W2-002 successful range restart: fresh Load sees 10000/15000 Range' `
+        ($sS2.Kind -eq $kindRange -and $sS2.MinMs -eq 10000 -and $sS2.MaxMs -eq 15000) `
+        "kind=$($sS2.Kind) min=$($sS2.MinMs) max=$($sS2.MaxMs)"
+
+    # Successful MANUAL restart: 5..10, fresh Load sees exactly that.
+    $dM = Join-Path $work ('w2_' + [Guid]::NewGuid().ToString('N')); New-Item -ItemType Directory -Path $dM | Out-Null
+    $sMn = $ctor.Invoke(@([string]$dM)); $sMn.Load()
+    $manualNext510 = {
+        param($s)
+        $next = @(
+            [System.Collections.Generic.KeyValuePair[string,string]]::new('ManualFromSec', '5'),
+            [System.Collections.Generic.KeyValuePair[string,string]]::new('ManualToSec', '10'),
+            [System.Collections.Generic.KeyValuePair[string,string]]::new('IntervalKind', 'manual')
+        )
+        $prev = @(
+            [System.Collections.Generic.KeyValuePair[string,string]]::new('ManualFromSec', '4'),
+            [System.Collections.Generic.KeyValuePair[string,string]]::new('ManualToSec', '7'),
+            [System.Collections.Generic.KeyValuePair[string,string]]::new('IntervalKind', 'range')
+        )
+        return $s.SaveIntervalState($next, $prev)
+    }
+    $retMn = [bool]$manualNext510.Invoke($sMn)
+    Check 'W2-002 successful manual transaction returns true' $retMn
+    $sMn2 = $ctor.Invoke(@([string]$dM)); $sMn2.Load()
+    Check 'W2-002 successful manual restart: fresh Load sees Manual 5/10' `
+        ($sMn2.Kind -eq $kindManual -and [int]$fromField.GetValue($sMn2) -eq 5 -and [int]$toField.GetValue($sMn2) -eq 10) `
+        "kind=$($sMn2.Kind) from=$([int]$fromField.GetValue($sMn2)) to=$([int]$toField.GetValue($sMn2))"
+
+    # Unrelated settings survive a successful interval commit.
+    $dU = Join-Path $work ('w2_' + [Guid]::NewGuid().ToString('N')); New-Item -ItemType Directory -Path $dU | Out-Null
+    Set-Content -LiteralPath (Join-Path $dU 'problip.ini') -NoNewline -Value ("[problip]`r`nVolume=0.37`r`nAutoStart=1`r`nRunOnLaunch=0`r`nShowBlipCounter=0`r`n" +
+        "StatsEnabled=0`r`nThemeId=theme_wintage_dracula`r`nBlipGlow=0`r`nAlwaysOnTop=0`r`nIntervalKind=range`r`nMinMs=4000`r`nMaxMs=7000`r`n")
+    $sU = $ctor.Invoke(@([string]$dU)); $sU.Load()
+    $retU = [bool]$rangeNext.Invoke($sU)
+    Check 'W2-002 unrelated-settings transaction succeeds' $retU
+    $sU2 = $ctor.Invoke(@([string]$dU)); $sU2.Load()
+    Check 'W2-002 unrelated settings survive the interval commit' `
+        ($sU2.Volume -eq 0.37 -and $sU2.AutoStart -and -not $sU2.RunOnLaunch -and -not $sU2.ShowBlipCounter -and
+         -not $sU2.StatsEnabled -and -not $sU2.BlipGlow -and -not $sU2.AlwaysOnTop -and
+         $themeIdField.GetValue($sU2) -eq 'theme_wintage_dracula') `
+        "vol=$($sU2.Volume) auto=$($sU2.AutoStart) run=$($sU2.RunOnLaunch) cnt=$($sU2.ShowBlipCounter) stats=$($sU2.StatsEnabled) glow=$($sU2.BlipGlow) top=$($sU2.AlwaysOnTop) theme=$($themeIdField.GetValue($sU2))"
+    Check 'W2-002 the committed interval itself took effect' ($sU2.MinMs -eq 10000 -and $sU2.MaxMs -eq 15000)
+
+    # Stale temp cleanup: a seeded stale candidate must not contaminate or survive.
+    $dT = Join-Path $work ('w2_' + [Guid]::NewGuid().ToString('N')); New-Item -ItemType Directory -Path $dT | Out-Null
+    Set-Content -LiteralPath (Join-Path $dT 'problip.ini') -NoNewline -Value "[problip]`r`nIntervalKind=range`r`nMinMs=4000`r`nMaxMs=7000`r`n"
+    Set-Content -LiteralPath (Join-Path $dT 'problip.ini.interval.tmp') -NoNewline -Value "[problip]`r`nIntervalKind=bogus`r`nMinMs=1`r`n"
+    $sT = $ctor.Invoke(@([string]$dT)); $sT.Load()
+    $retT = [bool]$rangeNext.Invoke($sT)
+    Check 'W2-002 a stale temp does not block or contaminate a successful transaction' $retT
+    $sT2 = $ctor.Invoke(@([string]$dT)); $sT2.Load()
+    Check 'W2-002 the stale temp was replaced by the new commit' ($sT2.MinMs -eq 10000 -and $sT2.MaxMs -eq 15000)
+    Check 'W2-002 successful commit leaves no temp behind' (-not (Test-Path -LiteralPath (& $tempOf $dT)))
+
+    # Missing INI: SaveIntervalState must work without a pre-existing file.
+    $dX = Join-Path $work ('w2_' + [Guid]::NewGuid().ToString('N')); New-Item -ItemType Directory -Path $dX | Out-Null
+    $sX = $ctor.Invoke(@([string]$dX)); $sX.Load()   # Load's fresh-install writes create it; use a truly raw dir
+    # For a genuinely missing INI (no fresh-install writes), point IniPath at a not-yet-created file.
+    $dX2 = Join-Path $work ('w2_' + [Guid]::NewGuid().ToString('N')); New-Item -ItemType Directory -Path $dX2 | Out-Null
+    $sX2 = $ctor.Invoke(@([string]$dX2))
+    $iniPathX2 = Join-Path $dX2 'problip.ini'
+    $retX = [bool]$rangeNext.Invoke($sX2)
+    Check 'W2-002 transaction succeeds with a missing INI (File.Move path)' $retX
+    Check 'W2-002 the missing-INI transaction created the file with the interval' `
+        ((Get-Content -Raw -LiteralPath $iniPathX2) -match 'MinMs=10000' -and (Get-Content -Raw -LiteralPath $iniPathX2) -match 'IntervalKind=range') `
+        "content=$((Get-Content -Raw -LiteralPath $iniPathX2) -replace "`r",'')"
+    Check 'W2-002 the missing-INI transaction leaves no temp' (-not (Test-Path -LiteralPath (& $tempOf $dX2)))
+
+    # Read-only directory: user-facing behavior preserved.
+    $roD = Join-Path $work 'w2_ro'; New-Item -ItemType Directory -Path $roD | Out-Null
+    Set-Content -LiteralPath (Join-Path $roD 'problip.ini') -NoNewline -Value "[problip]`r`nIntervalKind=range`r`nMinMs=4000`r`nMaxMs=7000`r`n"
+    $roS = $ctor.Invoke(@([string]$roD)); $roS.Load()
+    $roBytes0 = [IO.File]::ReadAllBytes((Join-Path $roD 'problip.ini'))
+    # Make the directory read-only for new-file creation (temp staging fails).
+    $acl = Get-Acl $roD
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule([Environment]::UserName, 'CreateDirectories,CreateFiles,Write', 'None', 'None', 'Deny')
+    $acl.AddAccessRule($rule)
+    Set-Acl -Path $roD -AclObject $acl
+    try {
+        $roRet = [bool]$rangeNext.Invoke($roS)
+        $roBytes1 = [IO.File]::ReadAllBytes((Join-Path $roD 'problip.ini'))
+        Check 'W2-002 read-only directory: transaction returns false' (-not $roRet)
+        Check 'W2-002 read-only directory: original INI unchanged' ([Convert]::ToBase64String($roBytes0) -eq [Convert]::ToBase64String($roBytes1))
+        Check 'W2-002 read-only directory: no temp created' (-not (Test-Path -LiteralPath (& $tempOf $roD)))
+        Check 'W2-002 read-only directory: Settings keep the old interval' ($roS.MinMs -eq 4000 -and $roS.MaxMs -eq 7000)
+    } finally {
+        # lift the deny so cleanup can remove the tree
+        $acl2 = Get-Acl $roD
+        $rule2 = New-Object System.Security.AccessControl.FileSystemAccessRule([Environment]::UserName, 'CreateDirectories,CreateFiles,Write', 'None', 'None', 'Deny')
+        $acl2.RemoveAccessRule($rule2) | Out-Null
+        Set-Acl -Path $roD -AclObject $acl2
+    }
 
     foreach ($k in $script:regKeys) { Remove-Item -LiteralPath "HKCU:\$k" -Recurse -Force -ErrorAction SilentlyContinue }
 } finally {

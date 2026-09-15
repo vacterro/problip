@@ -339,13 +339,20 @@ namespace Problip {
     $nowMsField.SetValue($eR, $nowMsField.GetValue($eR))  # keep the fake for the rest of this engine's life
 
     # ---- source contracts the wave names explicitly ----
-    $src = Get-Content -LiteralPath (Join-Path $root 'Problip.cs') -Raw
+    # -Encoding UTF8: Problip.cs carries a UTF-8 BOM and the tray caption uses
+    # a real em dash. A BOM-less harness read as ANSI would decode the em-dash
+    # literal as mojibake and false-fail the source contract.
+    $src = Get-Content -LiteralPath (Join-Path $root 'Problip.cs') -Raw -Encoding UTF8
     Check 'Program gates startup on the remembered preference via RunState' `
         ($src -match 'RunState\.ApplyLaunch\(s, engine\)' -and $src -match 'if \(s\.RunOnLaunch\) engine\.Start\(\);')
     Check 'the tray holds Start/Stop references and follows runtime state' `
         ($src -match 'miStart\.Enabled' -and $src -match 'miStop\.Enabled' -and $src -match 'engine\.StateChanged \+=')
+    # The em dash is built from its codepoint: a BOM-less harness file is read
+    # as ANSI by Windows PowerShell, so a literal em dash here would decode as
+    # mojibake and false-fail this source contract.
+    $emDash = [string][char]8212
     Check 'the tray caption is the explicit ON/OFF/ERR state' `
-        ($src -match '"problip — " \+ StateText')
+        ($src -match ('"problip ' + $emDash + ' " \+ StateText'))
     Check 'the settings ON/OFF buttons reflect actual state (ERR selects neither)' `
         ($src -match 'DrawButton\(g, sr, "ON", runOn\)' -and $src -match 'DrawButton\(g, pr, "OFF", !Engine\.IsBroken && !Engine\.IsOn\)')
     Check 'both UI surfaces share one Start/Stop command seam' `
