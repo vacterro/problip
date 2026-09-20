@@ -287,6 +287,10 @@ reflection, and exits non-zero if any harness fails. Individual harnesses
   no Android premium/store/trial content), Help's product-state immunity, the
   one reusable Help window behind all three entry points, theme-live Help
   projection and Help resource stability.
+- `test_ownership.ps1` — the persistence-ownership contract: a second process
+  in the same portable directory fails closed, a different portable directory
+  runs concurrently, and the ownership name keeps its fixed
+  `Global\Problip.Persistence.<sha256>` shape without exposing the raw path.
 - `test_settings.ps1` — settings round-trip, invariant normalization, and
   persistence-failure rollback, including the preview-once volume-commit
   contract.
