@@ -24,13 +24,18 @@
 #
 # DETERMINISTIC CLEANUP REGRESSION (fault-injection mode): passing the
 # explicit switch -InjectBodyFault makes the main body throw a deterministic
-# terminating error right after staging (before the app is launched). The
-# smoke then proves cleanup restored EVERY postcondition (INI hash, HKCU Run
-# presence/value, no launched process, no backup artifact, no accumulated
-# cleanup failure) and exits 0 if -- and only if -- that full
-# cleanup-on-body-failure regression holds. Fault mode is entered ONLY through
-# the switch: no ambient TEMP sentinel exists, so stale leftover state can
-# never silently change which test a normal run executes.
+# terminating error AFTER a real Problip.exe has been launched (PassThru
+# PID captured) and confirmed alive within the bounded startup contract --
+# i.e. the injection point sits past startup confirmation, so the launched-
+# process cleanup assertion is exercised against a REAL PID, never a null
+# $app. The smoke then proves cleanup restored EVERY postcondition (the exact
+# launched PID gone, INI hash, HKCU Run presence/value, no backup artifact,
+# no accumulated cleanup failure) and exits 0 if -- and only if -- that full
+# cleanup-on-body-failure regression holds. Fault mode is entered ONLY
+# through the switch: no ambient TEMP sentinel exists, so stale leftover
+# state can never silently change which test a normal run executes. The
+# fault-mode run does NOT wait through the normal 22 s audio observation:
+# its purpose is cleanup proof, not cadence proof.
 param(
     # The ONLY way to enter the deterministic body-fault regression mode.
     [switch]$InjectBodyFault
@@ -173,14 +178,21 @@ $bodyFault = [bool]$InjectBodyFault
 $exePath = Join-Path $root 'Problip.exe'
 $sameCopy = @(Get-Process -Name Problip -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exePath })
 if ($sameCopy.Count -gt 0) {
-    Write-Host ("SKIP  smoke2: this portable copy already owns its persistence mutex (PID(s) {0}); no user state was staged" -f (($sameCopy | ForEach-Object { $_.Id }) -join ', '))
-    exit 0
+    Write-Host ("SKIP/BLOCKED  smoke2: this portable copy already owns its persistence mutex (PID(s) {0}); no user state was staged" -f (($sameCopy | ForEach-Object { $_.Id }) -join ', '))
+    # TARGET C: a SKIP is NOT a successful smoke2 execution for PERF-001
+    # closure. It means the app was never launched or observed. PERF-001
+    # evidence must come from a run whose test-owned Problip.exe was actually
+    # launched and observed -- so this exit carries an explicit non-acceptance
+    # marker rather than a silent 0 that could be misread as a PASS.
+    Write-Host 'SKIP is NOT acceptance: no smoke-owned Problip.exe was launched or observed in this run; PERF-001 evidence requires a real launched-and-observed run.'
+    exit 2
 }
 
-# Capture unrelated pre-existing Problip PIDs (other portable copies) so the
-# final postcondition can prove they were left untouched (TARGET D).
+# Capture unrelated pre-existing Problip PIDs (other portable copies) for
+# diagnostic context ONLY (TARGET B): their independent liveness is never a
+# pass/fail condition, and they are never killed or failed on.
 $preExistingProcs = @(Get-Process -Name Problip -ErrorAction SilentlyContinue)
-Write-Host ("unrelated pre-existing Problip processes (must remain untouched): " + $(if ($preExistingProcs.Count) { ($preExistingProcs | ForEach-Object { $_.Id }) -join ', ' } else { '<none>' }))
+Write-Host ("unrelated pre-existing Problip processes (diagnostic only): " + $(if ($preExistingProcs.Count) { ($preExistingProcs | ForEach-Object { $_.Id }) -join ', ' } else { '<none>' }))
 
 $app = $null
 $bodyError = $null
@@ -192,15 +204,14 @@ try {
     Set-Content -LiteralPath $iniPath -Value "[problip]`r`nVolume=0.5`r`nMinMs=5000`r`nMaxMs=5000`r`nAutoStart=$stagedAutoStart`r`nRunOnLaunch=1" -Encoding ASCII
     Write-Host "staged smoke INI (Volume=0.5, Min=Max=5000, AutoStart=$stagedAutoStart); real INI backed up to temp"
 
-    if ($bodyFault) {
-        throw "deterministic body-fault injection: main smoke body aborted right after staging"
-    }
-
     # Launch the real app; ON comes from RunOnLaunch=1 at startup (no TEST press).
     # BOUNDED startup observation (TARGET C): Start-Process -PassThru hands us
     # the Process object directly -- no unbounded Get-Process spin. Fail fast
     # if the process exits during startup or is not observable within the
-    # documented startup bound (5 s).
+    # documented startup bound (5 s). This launch is REQUIRED in BOTH modes:
+    # in fault-injection mode the exception is thrown only AFTER startup has
+    # been confirmed, so the launched-process cleanup assertion runs against a
+    # real, non-null PID (TARGET A) instead of being vacuously true on $null.
     $app = Start-Process -FilePath (Join-Path $root 'Problip.exe') -PassThru
     $startupBoundMs = 5000
     # WaitForExit(ms) returns TRUE only if the process already EXITED within
@@ -213,6 +224,14 @@ try {
     if ($app.HasExited) { throw "launched Problip exited during startup" }
     $t0 = [DateTime]::Now
     Write-Host ("app launched, t0 = {0:HH:mm:ss.fff} (PID {1})" -f $t0, $app.Id)
+
+    if ($bodyFault) {
+        # Deterministic injection point (TARGET A): AFTER a real PassThru PID
+        # exists and startup confirmation passed. The exception is caught below
+        # and re-examined in the fault-mode epilogue, which requires the exact
+        # PID to be gone after cleanup.
+        throw "deterministic body-fault injection: main smoke body aborted AFTER startup confirmation of launched PID $($app.Id)"
+    }
 
     # Observe >= 17 s of the render peak; record rising edges (scheduled blips).
     # The shipped blip01.wav is stereo 44.1 kHz 16-bit with a 11760-byte data
@@ -350,7 +369,11 @@ if ($null -ne $bodyError) {
         # $script:fails is nonzero.
         $faultOk = $true
         $faultMsg = @()
-        if (-not $cleanupOk) { $faultOk = $false; $faultMsg += 'cleanup reported failure' }
+        # TARGET A: the regression is only meaningful if a real Problip PID
+        # was launched BEFORE the injection. A null $app here means the body
+        # aborted before Start-Process, and cleanup never got a real process
+        # obligation -- that can never count as a passing cleanup regression.
+        if ($null -eq $app) { $faultOk = $false; $faultMsg += 'injection happened before any real process was launched ($app is null)' }
         try {
             $hashFault = (Get-FileHash -LiteralPath $iniPath -Algorithm SHA256).Hash
             if ($null -eq $hashBefore -or $hashBefore -ne $hashFault) { $faultOk = $false; $faultMsg += 'INI hash not restored' }
@@ -368,6 +391,7 @@ if ($null -ne $bodyError) {
         }
         if (Test-Path -LiteralPath $bakPath) { $faultOk = $false; $faultMsg += "temporary backup remains: $bakPath" }
         if ($script:fails -ne 0) { $faultOk = $false; $faultMsg += "accumulated failures: $script:fails" }
+        Check 'deterministic body-fault path: injection happened AFTER startup confirmation (real non-null launched PID)' ($null -ne $app) "pid=$(if ($null -ne $app) { $app.Id } else { '<none>' })"
         Check 'deterministic body-fault path: ALL cleanup postconditions restored (INI, Run key, process, backup, no accumulated failure)' $faultOk ($faultMsg -join '; ')
         Write-Host 'body-fault regression observed: original failure was preserved through cleanup'
         if (-not $faultOk -or $script:fails -ne 0) { Write-Host "SMOKE2 FAILED (cleanup-on-body-failure regression, $script:fails failure(s))"; exit 1 }
@@ -392,8 +416,16 @@ if ($null -ne $app) {
     $smokePidGone = $app.HasExited -and ($null -eq (Get-Process -Id $app.Id -ErrorAction SilentlyContinue))
 }
 Check 'the PID this smoke launched is no longer alive' $smokePidGone "pid=$(if ($null -ne $app) { $app.Id } else { '<not launched>' })"
-$missing = @($preExistingProcs | Where-Object { $null -eq (Get-Process -Id $_.Id -ErrorAction SilentlyContinue) })
-Check 'unrelated pre-existing Problip processes remain untouched' ($missing.Count -eq 0) ("missing=" + $(if ($missing.Count) { ($missing | ForEach-Object { $_.Id }) -join ', ' } else { '<none>' }))
+# TARGET B: unrelated pre-existing Problip processes are logged for diagnostic
+# context ONLY. Their independent liveness is NOT a pass/fail postcondition:
+# an unrelated portable copy may legitimately exit, crash, or restart with a
+# new PID during the smoke window, and that proves nothing about this smoke.
+# The real ownership invariant is enforced structurally: same-path conflict is
+# detected before staging, cleanup kills ONLY the PassThru object this smoke
+# launched, and no foreign PID ever reaches Stop-Process / Process.Kill.
+if ($preExistingProcs.Count) {
+    Write-Host ("diagnostic: unrelated pre-existing Problip processes during this run: " + (($preExistingProcs | ForEach-Object { $_.Id }) -join ', '))
+}
 Check 'no temporary backup artifact remains' (-not (Test-Path -LiteralPath $bakPath)) "path=$bakPath"
 
 Write-Host '---'

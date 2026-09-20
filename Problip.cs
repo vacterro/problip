@@ -28,6 +28,21 @@ namespace Problip
         public const int WM_NCHITTEST = 0x84;
         public const int HTCAPTION = 2;
         public const int NONANTIALIASED_QUALITY = 3;
+
+        // W2-003: physical persistence-directory identity through a real handle.
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern IntPtr CreateFile(string lpFileName, uint dwDesiredAccess,
+            uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition,
+            uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern uint GetFinalPathNameByHandle(IntPtr hFile, System.Text.StringBuilder lpszFilePath, uint cchFilePath, uint dwFlags);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool CloseHandle(IntPtr hObject);
+
+        public const uint FILE_SHARE_ALL = 0x1 | 0x2 | 0x4;
+        public const uint OPEN_EXISTING = 3;
+        public const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+        public static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
     }
 
     // One live palette projection. Every paint site reads the SAME static
@@ -249,10 +264,20 @@ namespace Problip
 
     class Settings
     {
+        // W2-001: configuration AVAILABILITY is a distinct question from
+        // configuration CONTENT. Missing is the only state that intentionally
+        // creates fresh defaults; Healthy may project RunOnLaunch/AutoStart;
+        // Unreadable must never be treated as proof of any persisted preference
+        // (no fabricated RunOnLaunch=true, no Run-key clear/set, no overwrite).
+        public enum SettingsLoadState
+        {
+            Missing,
+            Healthy,
+            Unreadable
+        }
         // Central defaults: Load() falls back to these for invalid input, and a
         // fresh install writes them to problip.ini. One place, no scattered magic.
-        public const double DefaultVolume = 0.05;
-        public const int DefaultMinMs = 4000;
+        public const double DefaultVolume = 0.05;        public const int DefaultMinMs = 4000;
         public const int DefaultMaxMs = 7000;
         public const int MinMsFloor = 1000;
         public const int MaxMsCeiling = 60000;
@@ -336,6 +361,28 @@ namespace Problip
             GetPrivateProfileString("problip", key, def, sb, sb.Capacity, path);
             return sb.ToString();
         }
+
+        // W2-001: the settings baseline's AVAILABILITY, set by Load(). Default
+        // before any Load() is Missing (a constructed-but-unloaded Settings has
+        // no established intent). Only Healthy (or Missing) permits projecting
+        // behavior; Unreadable forbids every fabricated side effect.
+        public SettingsLoadState LoadState = SettingsLoadState.Missing;        // True when the persisted intent can be trusted enough to project.
+        public bool IsUsable { get { return LoadState != SettingsLoadState.Unreadable; } }
+
+        // W2-001: WHOLE-FILE readability probe. GetPrivateProfileString never
+        // reports an I/O failure -- it silently returns the default, making an
+        // unreadable configuration indistinguishable from a missing one. Reading
+        // the raw file bytes is a genuinely different mechanism that CAN fail,
+        // so an existing-but-unreadable baseline is classified Unreadable rather
+        // than being treated as fresh defaults. Injectable so a regression can
+        // force the read of an existing baseline to fail deterministically.
+        internal Func<string, string> ReadIniText = DefaultReadIniText;
+        static string DefaultReadIniText(string path)
+        {
+            if (!System.IO.File.Exists(path)) return null;
+            return System.IO.File.ReadAllText(path);
+        }
+
         // Best-effort persistence: returns false instead of swallowing the Win32
         // result, so a write into a read-only/non-writable directory is observable
         // rather than silently presented as saved state.
@@ -347,6 +394,19 @@ namespace Problip
 
         public void Load()
         {
+            // W2-001: classify availability BEFORE parsing. A failure to read an
+            // existing configuration is not proof of any preference: leave every
+            // field at its constructed default, write nothing, and let callers
+            // consult IsUsable before projecting RunOnLaunch/AutoStart.
+            string raw;
+            try { raw = ReadIniText(IniPath); }
+            catch
+            {
+                LoadState = SettingsLoadState.Unreadable;
+                return;
+            }
+            LoadState = raw == null ? SettingsLoadState.Missing : SettingsLoadState.Healthy;
+
             // Parse into temporaries: TryParse's out-value assignment used to
             // clobber fields with 0 on invalid text ("abc" -> Volume=0 instead of
             // the intended default), and only the winner was kept. Unparseable
@@ -937,6 +997,13 @@ namespace Problip
 
         internal StatsBaselineState BaselineState;
         internal BlipStatsRecord PendingDelta = new BlipStatsRecord();
+        // CORE-001: the wall-clock instant of the newest PendingDelta mutation,
+        // captured from the SAME `now` RecordBlip already used. Recovery merges
+        // the delta using THIS context under StateLock instead of a request-time
+        // timestamp that can go stale across a midnight/week/month boundary: the
+        // delta snapshot and its period identity are now coupled. Reset whenever
+        // PendingDelta is cleared.
+        internal DateTime PendingDeltaNow;
         internal Func<string, string> ReadText = DefaultReadText;
 
         // -- PERF-001 generation/ordering model --
@@ -981,6 +1048,14 @@ namespace Problip
         // At most one latest pending recovery request while the baseline is
         // unreadable. Guarded by WorkerLock; re-requesting is idempotent.
         bool PendingRecovery;
+        // CORE-003: generic dequeued-item activity, set the moment the worker
+        // takes EITHER a snapshot commit or a recovery item and cleared in a
+        // guaranteed finally after that item finishes. InFlightGen only models
+        // generation-specific snapshot commits, so without this flag WaitIdle
+        // returned a false idle while a recovery (which sets no InFlightGen)
+        // was already executing -- a test that trusted "worker drained" was
+        // race-prone. Guarded by WorkerLock.
+        bool WorkerActive;
         bool Disposed;
 
         class PendingCommit
@@ -1018,7 +1093,14 @@ namespace Problip
         }
         internal bool WorkerBusy
         {
-            get { lock (StateLock) { return InFlightGen != 0; } }
+            // CORE-003: generic worker activity -- a recovery sets no
+            // InFlightGen, so this must reflect WorkerActive as well, or a test
+            // observing "worker busy" during recovery would read a false idle.
+            get
+            {
+                lock (WorkerLock) { if (WorkerActive) return true; }
+                lock (StateLock) { return InFlightGen != 0; }
+            }
         }
         internal bool HasPendingSnapshot
         {
@@ -1080,6 +1162,20 @@ namespace Problip
             }
         }
 
+        // PERF-001: the main window's visible "BLIPS n" line consumes only the
+        // total. The full Snapshot allocates a BlipStatsSnapshot AND computes
+        // fresh DayKey/WeekKey/MonthKey strings on every call (including every
+        // 16 ms glow repaint). This primitive returns the one sanitized count
+        // under StateLock without those allocations. The full Snapshot stays
+        // for StatisticsForm, where period rollover semantics are required.
+        public long SnapshotTotal()
+        {
+            lock (StateLock)
+            {
+                return BlipStatsLogic.Sanitize(Record.TotalCount);
+            }
+        }
+
         // One successful scheduled blip: update memory, mark dirty, and publish
         // at most one latest pending snapshot to the background worker when the
         // batching window has elapsed -- counted from the last ATTEMPT, so a
@@ -1096,7 +1192,12 @@ namespace Problip
             lock (StateLock)
             {
                 if (BaselineState == StatsBaselineState.Unreadable)
+                {
                     BlipStatsLogic.Record(PendingDelta, now);
+                    // CORE-001: keep the delta's period context coupled to its
+                    // contents, from the SAME `now` used to mutate it.
+                    PendingDeltaNow = now;
+                }
                 else
                     BlipStatsLogic.Record(Record, now);
                 Dirty = true;
@@ -1143,19 +1244,16 @@ namespace Problip
 
         // Schedule a bounded recovery attempt on the worker. At most one latest
         // request exists; blips keep landing in the session delta meanwhile.
-        // The wall-clock instant used by the worker's merge is captured HERE on
-        // the scheduling thread (the production scheduled-audio thread or a
-        // test's main thread): the worker itself never invokes the LocalNow
-        // clock delegate, which a test may implement as a scriptblock that can
-        // only run on the thread that owns it.
-        DateTime RecoveryNow = DateTime.Now;
-
+        // The worker never invokes the LocalNow clock delegate (a test may
+        // implement it as a scriptblock that can only run on the thread that
+        // owns it). CORE-001: the merge period identity travels with the delta
+        // as PendingDeltaNow, captured under StateLock beside the delta it
+        // describes -- so the worker reads it, never a clock.
         void RequestRecovery()
         {
             lock (WorkerLock)
             {
                 if (Disposed) return;
-                RecoveryNow = LocalNow();      // captured on the calling thread
                 PendingRecovery = true;
                 EnsureWorkerLocked();
                 System.Threading.Monitor.PulseAll(WorkerLock);
@@ -1187,9 +1285,24 @@ namespace Problip
                     }
                     if (PendingRecovery) { PendingRecovery = false; recover = true; }
                     else { work = Pending; Pending = null; }   // the slot is free again
+                    // CORE-003: mark generic activity BEFORE releasing
+                    // WorkerLock, so WaitIdle can never observe a false idle
+                    // between dequeue and the running item. Covers both a
+                    // snapshot commit and a recovery.
+                    WorkerActive = true;
                 }
-                if (recover) RecoveryCommit();
-                else CommitSnapshot(work);
+                try
+                {
+                    if (recover) RecoveryCommit();
+                    else CommitSnapshot(work);
+                }
+                finally
+                {
+                    // Cleared only AFTER the item finished, then signalled so a
+                    // waiter that sees not-busy has already had its signal set.
+                    lock (WorkerLock) { WorkerActive = false; }
+                    IdleSignal.Set();
+                }
             }
         }
 
@@ -1307,16 +1420,20 @@ namespace Problip
                     lock (StateLock)
                     {
                         if (BaselineState != StatsBaselineState.Unreadable) return;
-                        // RecoveryNow is a plain DateTime captured on the
-                        // CALLER thread when the request was scheduled -- the
-                        // worker never invokes clock delegates off-thread.
-                        Record = BlipStatsLogic.MergeBaselineAndDelta(baseline, PendingDelta, RecoveryNow);
+                        // CORE-001: merge with the SAME period context the delta
+                        // was mutated under (PendingDeltaNow), captured atomically
+                        // with PendingDelta under StateLock -- NOT a request-time
+                        // timestamp that can be older than the delta across a
+                        // midnight/week/month boundary. This keeps every
+                        // successful blip in its applicable current period.
+                        Record = BlipStatsLogic.MergeBaselineAndDelta(baseline, PendingDelta, PendingDeltaNow);
                         // The committed value is an immutable captured COPY of
                         // the merged record, never the live Record: concurrent
                         // blips from here on mutate Record under StateLock and
                         // must not tear the snapshot being serialized.
                         merged = BlipStatsLogic.CopyRecord(Record);
                         PendingDelta = new BlipStatsRecord();   // captured+cleared atomically: no loss, no double count
+                        PendingDeltaNow = default(DateTime);    // paired context reset with the delta
                         BaselineState = StatsBaselineState.Healthy;
                         DataVersion++;
                         gen = ++PublishGen;
@@ -1360,14 +1477,17 @@ namespace Problip
         void ExitCommitGate() { System.Threading.Monitor.Exit(CommitGate); }
 
         // Bounded drain helper (tests/lifecycle): resolves when the worker has
-        // no in-flight commit and no pending work, or after the timeout.
+        // no in-flight item and no pending work, or after the timeout.
+        // CORE-003: WorkerActive (generic dequeued activity) is inspected
+        // alongside Pending/PendingRecovery/InFlightGen, so a recovery that is
+        // actively executing can never be reported as an idle worker.
         internal bool WaitIdle(int timeoutMs)
         {
             long start = Clock.ElapsedMilliseconds;
             while (true)
             {
                 bool busy;
-                lock (WorkerLock) { busy = Pending != null || PendingRecovery; }
+                lock (WorkerLock) { busy = Pending != null || PendingRecovery || WorkerActive; }
                 if (!busy) lock (StateLock) { busy = InFlightGen != 0; }
                 if (!busy) return true;
                 long remaining = timeoutMs - (Clock.ElapsedMilliseconds - start);
@@ -1487,8 +1607,15 @@ namespace Problip
                 lock (StateLock)
                 {
                     if (BaselineState != StatsBaselineState.Unreadable) return false;
-                    Record = BlipStatsLogic.MergeBaselineAndDelta(baseline, PendingDelta, LocalNow());
+                    // CORE-001: couple the merge period identity to the delta it
+                    // consumes. When a delta exists, use its own captured context
+                    // (PendingDeltaNow); only a genuinely empty delta falls back
+                    // to the current clock, so a boundary can never discard a
+                    // period count.
+                    DateTime mergeNow = PendingDelta.TotalCount == 0 ? LocalNow() : PendingDeltaNow;
+                    Record = BlipStatsLogic.MergeBaselineAndDelta(baseline, PendingDelta, mergeNow);
                     PendingDelta = new BlipStatsRecord();
+                    PendingDeltaNow = default(DateTime);
                     BaselineState = StatsBaselineState.Healthy;
                     DataVersion++;
                 }
@@ -1586,6 +1713,7 @@ namespace Problip
                     PublishGen++;             // the reset generation is now newest
                     Record = next;
                     PendingDelta = new BlipStatsRecord();
+                    PendingDeltaNow = default(DateTime);
                     BaselineState = StatsBaselineState.Healthy;
                     Dirty = false;
                     DataVersion++;
@@ -1775,8 +1903,21 @@ namespace Problip
 
         void NotifyStateChanged()
         {
+            _lastStateText = StateText;
             var h = StateChanged;
             if (h != null) h(this, EventArgs.Empty);
+        }
+
+        // PERF-002: StateChanged is edge-triggered against observable ON/OFF/ERR
+        // truth. A healthy Preview on an already-playable engine, or a repeated
+        // Stop of an already-healthy-OFF engine, is not a state edge and must
+        // not broadcast -- each subscriber (tray, main, Preferences) otherwise
+        // did full synchronous repaint/tray work for a no-op.
+        string _lastStateText;
+        void NotifyStateChangedIfChanged()
+        {
+            if (StateText == _lastStateText) return;
+            NotifyStateChanged();
         }
 
         void RaiseBlipPlayed()
@@ -1803,6 +1944,9 @@ namespace Problip
             Timer = new System.Windows.Forms.Timer();
             Timer.Tick += Tick;
             BuildCache();
+            // PERF-002 baseline: the constructor's own state letter, so a later
+            // Preview/Stop can tell whether it actually changed observable state.
+            _lastStateText = StateText;
         }
 
         void BuildCache()
@@ -1992,8 +2136,16 @@ namespace Problip
                     int v = BitConverter.ToInt32(outb, i);
                     long n = (long)Math.Round((double)v * gain);
                     if (n > int.MaxValue) n = int.MaxValue; else if (n < int.MinValue) n = int.MinValue;
-                    byte[] tmp = BitConverter.GetBytes((int)n);
-                    outb[i] = tmp[0]; outb[i + 1] = tmp[1]; outb[i + 2] = tmp[2]; outb[i + 3] = tmp[3];
+                    // Direct little-endian writes of the already-clamped value:
+                    // the old path called the BitConverter byte-array helper,
+                    // allocating one temporary 4-byte array per sample in this
+                    // supported 32-bit path (large custom WAVs turned a volume
+                    // commit into UI-thread GC churn). The 8/16/24 branches
+                    // already write bytes directly; this matches them.
+                    outb[i] = (byte)((int)n & 0xFF);
+                    outb[i + 1] = (byte)(((int)n >> 8) & 0xFF);
+                    outb[i + 2] = (byte)(((int)n >> 16) & 0xFF);
+                    outb[i + 3] = (byte)(((int)n >> 24) & 0xFF);
                 }
             }
             return outb;
@@ -2094,11 +2246,13 @@ namespace Problip
                     Enabled = false;
                     if (Timer != null) Timer.Stop();
                 }
-                NotifyStateChanged();
+                NotifyStateChangedIfChanged();   // PERF-002: only a real ON->ERR edge
                 return false;
             }
             PreviewCount++;
-            NotifyStateChanged();
+            // PERF-002: a healthy preview does not change observable state on an
+            // already-playable engine (OFF stays OFF, ON stays ON), so no edge.
+            NotifyStateChangedIfChanged();
             return true;
         }
 
@@ -2120,7 +2274,7 @@ namespace Problip
                 // and leave recovery to an explicit Start()/Preview().
                 Enabled = false;
                 if (Timer != null) Timer.Stop();
-                NotifyStateChanged();
+                NotifyStateChangedIfChanged();   // PERF-002: real ON->ERR edge only
                 return;
             }
             // Scheduled-play observation seam (tests\\engine contract): counted
@@ -2175,6 +2329,11 @@ namespace Problip
         }
         public void Stop()
         {
+            // PERF-002: a repeated Stop on an already-healthy-OFF engine is not
+            // an observable edge and must not broadcast full-surface repaint/tray
+            // work. ON->OFF and ERR->OFF (the engine stops claiming a broken ON)
+            // remain real transitions and still notify once.
+            bool wasObservablyRunning = Enabled || IsBroken;
             Enabled = false;
             if (Timer != null) Timer.Stop();
             // A stopped session resets the PULSE phase; the next Start begins
@@ -2184,7 +2343,7 @@ namespace Problip
             // Best-effort only -- a failure keeps the dirty state for a later
             // retry and must not affect the ON/OFF transition below.
             if (Stats != null) Stats.FlushIfDirty();
-            NotifyStateChanged();
+            if (wasObservablyRunning) { _lastStateText = StateText; NotifyStateChanged(); }
         }
         // Change the interval identity. kind + minMs/maxMs carry mode and bounds
         // in ONE call (for Range: the preset ms; for Manual: resolved bounds;
@@ -2359,6 +2518,10 @@ namespace Problip
         // itself -- never fake ON, and the preference is never rewritten.
         public static void ApplyLaunch(Settings s, BlipEngine engine)
         {
+            // W2-001: never arm the beeper from a fabricated RunOnLaunch=true.
+            // An unreadable baseline proves no preference, so the safe degraded
+            // state is a resident but paused tray app.
+            if (!s.IsUsable) return;
             if (s.RunOnLaunch) engine.Start();
         }
 
@@ -2407,7 +2570,13 @@ namespace Problip
         Success,
         ForwardProjectionFailed,
         PersistenceFailedRollbackSucceeded,
-        PersistenceFailedRollbackFailed
+        PersistenceFailedRollbackFailed,
+        // Forward projection was indeterminate (mutation may have landed but
+        // could not be verified) AND the compensating reconciliation back to
+        // the previous intent could not be verified either. Distinct from
+        // ForwardProjectionFailed, which now means the previous projection was
+        // verified restored.
+        ForwardProjectionUnrestored
     }
 
     // Persistence ownership bound to the data directory (problip.ini / problip.stats.ini).
@@ -2421,10 +2590,16 @@ namespace Problip
         private PersistenceOwnership(System.Threading.Mutex m) { _m = m; }
 
         // Returns the canonical Global-namespace mutex name for the given directory.
-        // Normalizes: full path, uppercase invariant.
+        // W2-003: identity is derived from a CANONICAL FINAL directory identity,
+        // not the lexical path string. A reparse point / junction / mapped-drive
+        // alias resolving to the same physical directory must yield the SAME name
+        // or two processes could write the same INI/statistics files. When that
+        // identity cannot be established, fail closed (throw) rather than mint an
+        // ambiguous second writer.
         public static string NameForDirectory(string dir)
         {
-            string full = System.IO.Path.GetFullPath(dir).ToUpperInvariant();
+            string full = System.IO.Path.GetFullPath(dir);
+            full = FinalDirectoryIdentity(full).ToUpperInvariant();
             full = full.TrimEnd(System.IO.Path.DirectorySeparatorChar);
             using (var sha = System.Security.Cryptography.SHA256.Create())
             {
@@ -2433,6 +2608,34 @@ namespace Problip
                 foreach (byte b in hash) sb.Append(b.ToString("X2"));
                 return "Global\\Problip.Persistence." + sb.ToString();
             }
+        }
+
+        // Resolves the directory through an actual directory HANDLE and returns
+        // its canonical final path, collapsing reparse-point and equivalent path
+        // aliases. Throws IOException when the handle or final path cannot be
+        // obtained (fail closed).
+        static string FinalDirectoryIdentity(string fullPath)
+        {
+            IntPtr h = Native.CreateFile(
+                fullPath, 0, Native.FILE_SHARE_ALL, IntPtr.Zero,
+                Native.OPEN_EXISTING, Native.FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero);
+            if (h == Native.INVALID_HANDLE_VALUE || h == IntPtr.Zero)
+                throw new System.IO.IOException("cannot open persistence directory for identity: " + fullPath);
+            try
+            {
+                var sb = new System.Text.StringBuilder(1024);
+                uint n = Native.GetFinalPathNameByHandle(h, sb, (uint)sb.Capacity, 0);
+                if (n == 0 || n > sb.Capacity)
+                    throw new System.IO.IOException("cannot resolve persistence directory identity: " + fullPath);
+                string final = sb.ToString();
+                // Strip the extended-length prefix so a \\?\V:\ form and a plain
+                // V:\ form of the SAME directory converge; keep the UNC form.
+                const string dosPrefix = @"\\?\";
+                if (final.StartsWith(dosPrefix, StringComparison.Ordinal))
+                    final = final.Substring(dosPrefix.Length);
+                return final;
+            }
+            finally { Native.CloseHandle(h); }
         }
 
         // Attempts to acquire ownership for the directory. Returns true on success,
@@ -2486,7 +2689,23 @@ namespace Problip
             bool previous = s.AutoStart;
             bool enable = !previous;
             bool forward = enable ? RegSet(keyPath, exePath) : RegClear(keyPath);
-            if (!forward) return AutoStartResult.ForwardProjectionFailed;
+            if (!forward)
+            {
+                // A false forward result is "projection state UNKNOWN", not
+                // "nothing happened": AutoStart.Set/Clear combine the mutation
+                // with its postcondition verification under one bool, so a
+                // mutation that landed but could not be verified also reports
+                // false. The persisted INI intent never changed (persistence of
+                // the requested value never began), so reconcile the registry
+                // back to the PREVIOUS authoritative intent and record whether
+                // that reconciliation was verified. Never claim the external
+                // startup state is unchanged when restoration is unproven.
+                bool restored = previous ? RegSet(keyPath, exePath) : RegClear(keyPath);
+                ProjectionHealthy = restored;
+                return restored
+                    ? AutoStartResult.ForwardProjectionFailed
+                    : AutoStartResult.ForwardProjectionUnrestored;
+            }
             try
             {
                 s.AutoStart = enable;
@@ -2510,6 +2729,10 @@ namespace Problip
         // and leaves the intent intact for a later repair.
         internal static void ProjectAtStartup(Settings s, string keyPath, string exePath)
         {
+            // W2-001: an unreadable configuration proves no intent, so a
+            // fabricated AutoStart=false must NOT clear a valid Run entry.
+            // Mark the projection degraded and change nothing externally.
+            if (!s.IsUsable) { ProjectionHealthy = false; return; }
             bool ok = s.AutoStart ? RegSet(keyPath, exePath) : RegClear(keyPath);
             ProjectionHealthy = ok;
         }
@@ -2522,6 +2745,8 @@ namespace Problip
                     return "Autostart " + (s.AutoStart ? "enabled" : "disabled") + ".";
                 case AutoStartResult.ForwardProjectionFailed:
                     return "Could not change the startup entry.\r\nThe autostart setting was not changed.\r\n" + s.IniPath;
+                case AutoStartResult.ForwardProjectionUnrestored:
+                    return "Could not change the startup entry.\r\nThe autostart setting was not changed, but the previous startup entry could not be verified.\r\n" + s.IniPath;
                 case AutoStartResult.PersistenceFailedRollbackSucceeded:
                     return "Could not save the autostart setting.\r\nThe previous value stays in effect.\r\n" + s.IniPath;
                 default:
@@ -2659,6 +2884,48 @@ namespace Problip
         internal int GlowTimerStartCount;   // test seam: glow starts observed
         internal int GlowTimerStopCount;    // test seam: glow stops observed
 
+        // PERF-001: immutable preset data. The six Range presets are compile-time
+        // constants; they used to be two fresh arrays allocated on EVERY paint.
+        static readonly int[] PresetMinsSec = { 4, 5, 10, 15, 20, 30 };
+        static readonly int[] PresetMaxsSec = { 7, 5, 10, 15, 20, 30 };
+
+        // PERF-001: reusable HotZone instances and their stable Actions, built
+        // once per form. OnPaint no longer allocates 18-19 HotZone objects and
+        // 6 capturing closures per paint (Glow drives paints at a 16 ms cadence);
+        // it only updates each zone's Rectangle from the same layout math that
+        // paints it, so painted and clickable geometry stay identical.
+        HotZone CloseZone, HelpZone, BlipsZone, VolThumbZone, ManualZone,
+                PulseZone, ThemeZone, GlowZone, AutoZone, StartZone, StopZone,
+                TestZone, PrefsZone;
+        HotZone[] PresetZones;
+
+        void InitHotZones()
+        {
+            CloseZone = new HotZone { A = delegate() { Hide(); } };
+            HelpZone = new HotZone { A = delegate() { if (OpenHelp != null) OpenHelp(); } };
+            BlipsZone = new HotZone { A = delegate() { if (OpenStatistics != null) OpenStatistics(); } };
+            VolThumbZone = new HotZone { A = delegate() { StartVolumeDrag(); } };
+            ManualZone = new HotZone { A = delegate() { OpenManualEditor(); } };
+            PulseZone = new HotZone { A = delegate() { ApplyPulse(); } };
+            ThemeZone = new HotZone { A = delegate() { if (OpenThemes != null) OpenThemes(); } };
+            GlowZone = new HotZone { A = delegate() { ToggleGlow(); } };
+            AutoZone = new HotZone { A = delegate() { ToggleAutostart(); } };
+            StartZone = new HotZone { A = delegate() { RequestStart(); } };
+            StopZone = new HotZone { A = delegate() { RequestStop(); } };
+            // PERF-002: ONE repaint owner. The engine's edge-triggered
+            // StateChanged now drives the state projection; Preview() no longer
+            // emits a fake state change on a healthy engine, so this path must
+            // NOT duplicate SyncTray()/Refresh() around it.
+            TestZone = new HotZone { A = delegate() { Engine.Preview(); } };
+            PrefsZone = new HotZone { A = delegate() { if (OpenPreferences != null) OpenPreferences(); } };
+            PresetZones = new HotZone[PresetMinsSec.Length];
+            for (int i = 0; i < PresetMinsSec.Length; i++)
+            {
+                int cmn = PresetMinsSec[i] * 1000, cmx = PresetMaxsSec[i] * 1000;
+                PresetZones[i] = new HotZone { A = delegate() { ApplyRange(cmn, cmx); } };
+            }
+        }
+
         // Shared Start/Stop command seam: both UI surfaces (tray menu, settings
         // window) go through RunState so persistence behavior cannot drift. The
         // engine obeys FIRST, the session's desired run intent updates
@@ -2696,8 +2963,15 @@ namespace Problip
             // queued replay: the glow simply never starts (no stale glow when
             // the form is shown later). A new event while active restarts from
             // the rise origin; alpha never stacks beyond GlowModel.MaxAlpha.
-            if (Visible && S.BlipGlow) StartGlow();
-            Invalidate();
+            // PERF-002: StartGlow() already performs the initial Invalidate, so
+            // a glow-active blip must not request a second one. Outside glow,
+            // repaint only when the visible BLIPS counter can actually change.
+            if (Visible && S.BlipGlow)
+            {
+                StartGlow();
+                return;
+            }
+            if (S.ShowBlipCounter) Invalidate();
         }
 
         // Starts/restarts the glow from the rise origin. The timer runs only
@@ -2784,6 +3058,9 @@ namespace Problip
             BackColor = Palette.BG;
             DoubleBuffered = true;
             TopMost = s.AlwaysOnTop;
+            // PERF-001: build the reusable HotZone graph once, before the first
+            // paint. OnPaint only updates each zone's rectangle thereafter.
+            InitHotZones();
             // Apply the persisted theme to THIS form at construction (BackColor
             // and child state; the paint reads Palette.* directly).
             ApplyTheme();
@@ -2903,7 +3180,7 @@ namespace Problip
             DrawText(g, "problip", 8, 4, Palette.TEXT, 12, true);
             var xr = new Rectangle(Width - 20, 0, 20, 20);
             CloseRect = xr;
-            Hot.Add(MakeHot(xr, delegate() { Hide(); }));
+            AddZone(CloseZone, xr);
             DrawText(g, "X", Width - 16, 4, Palette.TEXT2, 12, true);
 
             // "?" Help affordance: same custom pixel style, one 16x20 hot zone
@@ -2911,7 +3188,7 @@ namespace Problip
             // WndProc stops at this rectangle, so the click reaches the HotZone
             // exactly as painted (same geometry drives both).
             HelpRect = new Rectangle(Width - 40, 0, 16, 20);
-            Hot.Add(MakeHot(HelpRect, delegate() { if (OpenHelp != null) OpenHelp(); }));
+            AddZone(HelpZone, HelpRect);
             DrawText(g, "?", Width - 37, 3, Palette.TEXT2, 12, true);
 
             // status — only the truth, top-right. A broken sound asset is its own
@@ -2932,12 +3209,12 @@ namespace Problip
             BlipsRect = Rectangle.Empty;
             if (S.ShowBlipCounter)
             {
-                long total = Engine.Stats.Snapshot().Total;
+                long total = Engine.Stats.SnapshotTotal();
                 string blips = "BLIPS " + total.ToString("N0", System.Globalization.CultureInfo.CurrentCulture);
                 DrawText(g, blips, 8, 22, Palette.TEXT2, 11);
                 int bw = TextW(g, blips, 11);
                 BlipsRect = new Rectangle(6, 20, bw + 4, 16);
-                Hot.Add(MakeHot(BlipsRect, delegate() { if (OpenStatistics != null) OpenStatistics(); }));
+                AddZone(BlipsZone, BlipsRect);
             }
 
             // ── volume slider 0..100 ──
@@ -2951,7 +3228,7 @@ namespace Problip
                 g.FillRectangle(fill, VolTrack.X + 1, VolTrack.Y + 1, (int)((VolTrack.Width - 2) * S.Volume), VolTrack.Height - 2);
             int thx = VolTrack.X + (int)((VolTrack.Width - 10) * S.Volume);
             var thr = new Rectangle(thx, yv - 3, 10, 18);
-            Hot.Add(MakeHot(thr, delegate() { StartVolumeDrag(); }));
+            AddZone(VolThumbZone, thr);
             DrawBevel(g, thr, true);
             using (var tb = new SolidBrush(Palette.ALT)) g.FillRectangle(tb, thr.X + 1, thr.Y + 1, thr.Width - 2, thr.Height - 2);
             DrawText(g, pct + "%", 210, yv + 1, Palette.TEXT, 11, true);
@@ -2960,17 +3237,14 @@ namespace Problip
             int yi = PresetRowY;
             DrawText(g, "sec", 8, yi + 4, Palette.TEXT2, 11);
             int xi = 32;
-            int[] mins = new int[] { 4, 5, 10, 15, 20, 30 };
-            int[] maxs = new int[] { 7, 5, 10, 15, 20, 30 };
-            for (int i = 0; i < mins.Length; i++)
+            for (int i = 0; i < PresetMinsSec.Length; i++)
             {
-                int mn = mins[i] * 1000, mx = maxs[i] * 1000;
+                int mn = PresetMinsSec[i] * 1000, mx = PresetMaxsSec[i] * 1000;
                 bool sel = S.Kind == IntervalKind.Range && S.MinMs == mn && S.MaxMs == mx;
                 string lbl = mn == mx ? (mn / 1000) + "s" : (mn / 1000) + "-" + (mx / 1000);
                 int w = TextW(g, lbl, 10) + 10;
                 var r = new Rectangle(xi, yi, w, 22);
-                int cmn = mn, cmx = mx;
-                Hot.Add(MakeHot(r, delegate() { ApplyRange(cmn, cmx); }));
+                AddZone(PresetZones[i], r);
                 DrawButton(g, r, lbl, sel, 10);
                 xi += w + 3;
             }
@@ -2982,10 +3256,10 @@ namespace Problip
             LayoutModeRow(g, out modeNeedIgnored);
             bool manualSel = S.Kind == IntervalKind.Manual;
             bool pulseSel = S.Kind == IntervalKind.Pulse;
-            Hot.Add(MakeHot(ManualRect, delegate() { OpenManualEditor(); }));
+            AddZone(ManualZone, ManualRect);
             string manualLabel = manualSel ? "MANUAL " + S.ManualFromSec + "-" + S.ManualToSec : "MANUAL";
             DrawButton(g, ManualRect, manualLabel, manualSel, 9);
-            Hot.Add(MakeHot(PulseRect, delegate() { ApplyPulse(); }));
+            AddZone(PulseZone, PulseRect);
             DrawButton(g, PulseRect, "PULSE", pulseSel, 9);
 
             // ── utility row: THEME / GLOW ──
@@ -2993,13 +3267,13 @@ namespace Problip
             // theme name truncates within its allotted rectangle (real TextW
             // measurement), never drawing outside the client.
             LayoutUtilityRow(g);
-            Hot.Add(MakeHot(ThemeRect, delegate() { if (OpenThemes != null) OpenThemes(); }));
+            AddZone(ThemeZone, ThemeRect);
             DrawText(g, "THEME", ThemeRect.X, ThemeRect.Y + 4, Palette.TEXT2, 10);
             string themeName = ThemeModel.ById(S.ThemeId).Name;
             DrawText(g, TruncateThemeName(g, themeName, ThemeNameMaxWidth(g)),
                      ThemeRect.X + ThemeLabelW + 6, ThemeRect.Y + 4, Palette.TEXT, 10, true);
             bool glowOn = S.BlipGlow;
-            Hot.Add(MakeHot(GlowRect, delegate() { ToggleGlow(); }));
+            AddZone(GlowZone, GlowRect);
             DrawButton(g, GlowRect, glowOn ? "[X] GLOW" : "[ ] GLOW", glowOn, 9);
 
             // ── bottom row: autostart + ON/OFF + TEST ──
@@ -3014,7 +3288,7 @@ namespace Problip
             LayoutBottomRow(g, out needW);
             AutoStartPaintedLabel = autoLabel;
             var ar = AutoRect;
-            Hot.Add(MakeHot(ar, delegate() { ToggleAutostart(); }));
+            AddZone(AutoZone, ar);
             DrawButton(g, ar, autoLabel, ao, 10);
 
             // ON/OFF reflect the ACTUAL runtime state (ERR = neither selected;
@@ -3023,20 +3297,20 @@ namespace Problip
             // run preference is updated exactly like the tray menu's Start/Stop.
             bool runOn = Engine.IsOn && !Engine.IsBroken;
             var sr = StartRect;
-            Hot.Add(MakeHot(sr, delegate() { RequestStart(); }));
+            AddZone(StartZone, sr);
             DrawButton(g, sr, "ON", runOn);
             var pr = StopRect;
-            Hot.Add(MakeHot(pr, delegate() { RequestStop(); }));
+            AddZone(StopZone, pr);
             DrawButton(g, pr, "OFF", !Engine.IsBroken && !Engine.IsOn);
             // Compact explicit preview affordance: same Engine.Preview() API the
             // tray Test blip and the volume commit use -- no second sound path.
             var tr = TestRect;
-            Hot.Add(MakeHot(tr, delegate() { Engine.Preview(); SyncTray(); Refresh(); }));
+            AddZone(TestZone, tr);
             DrawButton(g, tr, "TEST", false, 9);
 
             int prefsW = TextW(g, "PREFS", 9) + 14;
             PrefsRect = new Rectangle(8, PrefsRowY, prefsW, 22);
-            Hot.Add(MakeHot(PrefsRect, delegate() { if (OpenPreferences != null) OpenPreferences(); }));
+            AddZone(PrefsZone, PrefsRect);
             DrawButton(g, PrefsRect, "PREFS", false, 9);
 
             // The reason, in the window, when there is one. Pressing ON with a
@@ -3057,12 +3331,16 @@ namespace Problip
             return s.Substring(0, Math.Max(1, s.Length - 4)) + "...";
         }
 
-        static HotZone MakeHot(Rectangle r, Action a)
+        // PERF-001: register a REUSED zone at its freshly painted rectangle.
+        // The HotZone instance and its Action are created once (InitHotZones);
+        // OnPaint only updates the geometry, keeping the painted and clickable
+        // rectangles identical while eliminating per-paint HotZone/closure
+        // allocation. Hot still exposes the same ordered list OnMouseDown and
+        // the repaint regression consume.
+        void AddZone(HotZone z, Rectangle r)
         {
-            HotZone h = new HotZone();
-            h.R = r;
-            h.A = a;
-            return h;
+            z.R = r;
+            Hot.Add(z);
         }
 
         void DrawText(Graphics g, string s, int x, int y, Color c, int pt, bool bold = false)
@@ -3219,12 +3497,13 @@ namespace Problip
         }
 
         // Committed a volume: preview exactly once through the shared
-        // preference, then refresh. A rejected value never reaches here.
+        // preference. PERF-002: a genuine state change during preview is
+        // projected by the edge-triggered StateChanged path (tray + main +
+        // Preferences); the old explicit SyncTray()/Refresh() here duplicated
+        // that synchronous repaint on every healthy preview.
         internal void CommitVolumePreview()
         {
             if (S.PreviewOnVolumeChange) Engine.Preview();
-            SyncTray();
-            Refresh();
         }
 
         void PreviewAfterVolumeCommit() { CommitVolumePreview(); }
@@ -4839,6 +5118,11 @@ namespace Problip
 
                 Settings s = new Settings(dir);
                 s.Load();
+                // W2-001: an unreadable existing configuration is a truthful
+                // degraded state, not fresh defaults. Do not fabricate
+                // RunOnLaunch/AutoStart projections from it; surface ONE
+                // concise read-failure and stay resident/paused.
+                bool configUnreadable = !s.IsUsable;
 
                 BlipEngine engine = new BlipEngine(s);
                 // Startup honors the remembered user intent: RunOnLaunch=1
@@ -4901,7 +5185,9 @@ namespace Problip
                 {
                     try
                     {
-                        tray.Text = TrayText(engine);
+                        // W2-001: an unreadable configuration degrades the caption
+                        // truthfully (nothing fabricated).
+                        tray.Text = configUnreadable ? "problip — CONFIG UNREADABLE" : TrayText(engine);
                         miStart.Enabled = !engine.IsOn || engine.IsBroken;
                         miStop.Enabled = engine.IsOn && !engine.IsBroken;
                     }
@@ -4909,6 +5195,11 @@ namespace Problip
                 };
                 engine.StateChanged += onState;
                 onState(null, EventArgs.Empty);
+
+                // W2-001: surface ONE concise configuration-read failure. Never a
+                // fabricated preference projection; the app stays resident.
+                if (configUnreadable)
+                    NotifySettingsLoadFailure(s);
 
                 // always fix the autostart entry on every boot: the INI is the
                 // authority, the Run key is its projectioncolon. A projection
@@ -4939,6 +5230,18 @@ namespace Problip
         static string TrayText(BlipEngine engine)
         {
             return engine.TrayCaption;
+        }
+
+        // W2-001: the one concise degraded-state surface for an unreadable
+        // settings baseline. Message-only (no .Show at startup would block); the
+        // session stays resident with safe defaults and no fabricated
+        // Run-key/RunOnLaunch projection.
+        static void NotifySettingsLoadFailure(Settings s)
+        {
+            string msg = "PROBLIP could not read its settings.\r\n"
+                + "Running with safe defaults; the file was left unchanged.\r\n" + s.IniPath;
+            try { System.Windows.Forms.MessageBox.Show(msg, "problip", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+            catch { }
         }
 
         static void ShowForm(Settings s, BlipEngine engine, NotifyIcon tray)
@@ -5019,6 +5322,12 @@ namespace Problip
             if (_statsForm != null && !_statsForm.IsDisposed) { _statsForm.BackColor = Palette.BG; _statsForm.Invalidate(); }
             if (_themesForm != null && !_themesForm.IsDisposed) { _themesForm.BackColor = Palette.BG; _themesForm.Invalidate(); }
             if (_helpForm != null && !_helpForm.IsDisposed) _helpForm.ApplyTheme();
+            // PreferencesForm is a reusable top-level window exactly like the
+            // others and its own ApplyTheme already sets BackColor + Invalidate.
+            // Omitting it left an open Preferences window on the old palette
+            // after a theme switch (its painted theme name is read from
+            // S.ThemeId at paint time, so without invalidation it stayed stale).
+            if (_prefsForm != null && !_prefsForm.IsDisposed) _prefsForm.ApplyTheme();
         }
 
         // One live Help instance, owned like the statistics view: the title-bar

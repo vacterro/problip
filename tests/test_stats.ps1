@@ -1256,6 +1256,112 @@ TotalCount=50
     Check 'PERF-001 stop: Start again after Stop still persists (worker reusable)' ($drainZD -and ((Get-Content -Raw -LiteralPath (Join-Path $dirZD 'problip.stats.ini')) -match 'TotalCount=2'))
     $eZD.Cleanup()
 
+    # ==================== CORE-003: recovery-drain accounting ====================
+    # A recovery actively executing must not read as an idle worker. The
+    # RecoveryCapturePause seam blocks the worker AFTER it has dequeued the
+    # recovery (so PendingRecovery is already false) and BEFORE its physical
+    # write; WorkerBusy must stay true and WaitIdle must return false until it
+    # is released.
+    $dirWA = Join-Path $work 'core003drain'; New-Item -ItemType Directory -Path $dirWA | Out-Null
+    Set-Content -LiteralPath (Join-Path $dirWA 'problip.stats.ini') -NoNewline -Value @"
+[stats]
+DayKey=$dkL
+TodayCount=1
+WeekKey=$wkL
+WeekCount=1
+MonthKey=$mkL
+MonthCount=1
+TotalCount=10
+"@
+    $ctor2WA = $storeType.GetConstructor($flags, $null, @([string], [Func[string,string]]), $null)
+    $stWA = $ctor2WA.Invoke(@([string]$dirWA, (New-ThrowingRead 'unreadable for drain')))
+    $localNowField.SetValue($stWA, [Func[datetime]]{ param() $D0 })
+    $script:clockWA = [long]0
+    $storeType.GetField('NowMs', $flags).SetValue($stWA, [Func[long]]{ param() $script:clockWA })
+    $readTextField.SetValue($stWA, (New-RealRead))
+    $pauseWA = New-BlockGate
+    $storeType.GetField('RecoveryCapturePause', $flags).SetValue($stWA, [Func[bool]]$pauseWA.Gate)
+    $script:clockWA = 20000
+    $storeRecordBlipM.Invoke($stWA, @()) | Out-Null      # schedules worker recovery
+    $enteredWA = [bool]$pauseWA.Wait.Invoke(10000)
+    Check 'CORE-003: worker entered the recovery (post-dequeue, pre-write) seam' $enteredWA
+    $busyWA = [bool]$storeType.GetProperty('WorkerBusy', $flags).GetValue($stWA, $null)
+    $pendingRecWA = [bool]$storeType.GetProperty('HasPendingRecovery', $flags).GetValue($stWA, $null)
+    Check 'CORE-003: recovery is dequeued (HasPendingRecovery false) yet the worker is active' `
+        ((-not $pendingRecWA) -and $busyWA) "pending=$pendingRecWA busy=$busyWA"
+    $idleWhileWA = [bool]$waitIdleM.Invoke($stWA, @([int]300))
+    Check 'CORE-003: WaitIdle(short) returns false while recovery is blocked' (-not $idleWhileWA)
+    $null = $pauseWA.Open.Invoke()
+    $idleAfterWA = [bool]$waitIdleM.Invoke($stWA, @([int]5000))
+    Check 'CORE-003: WaitIdle resolves only after recovery finishes' $idleAfterWA
+    $storeType.GetField('RecoveryCapturePause', $flags).SetValue($stWA, $null)
+    $stWA.Flush() | Out-Null
+
+    # ==================== CORE-001: boundary-recovery period coupling ====================
+    # Recovery requested before a midnight boundary, executed after it, must not
+    # discard the post-midnight period count. The delta's own period context
+    # (PendingDeltaNow) travels with the delta, so the merge lands it in the
+    # correct day bucket. A pre-write pause makes the race deterministic.
+    $dirWB = Join-Path $work 'core001boundary'; New-Item -ItemType Directory -Path $dirWB | Out-Null
+    $dayB0 = Get-Key $dayKeyM ([datetime]'2026-09-08')
+    Set-Content -LiteralPath (Join-Path $dirWB 'problip.stats.ini') -NoNewline -Value @"
+[stats]
+DayKey=$dayB0
+TodayCount=10
+WeekKey=$(Get-Key $weekKeyM ([datetime]'2026-09-08'))
+WeekCount=20
+MonthKey=$(Get-Key $monthKeyM ([datetime]'2026-09-08'))
+MonthCount=30
+TotalCount=100
+"@
+    $ctor2WB = $storeType.GetConstructor($flags, $null, @([string], [Func[string,string]]), $null)
+    $stWB = $ctor2WB.Invoke(@([string]$dirWB, (New-ThrowingRead 'unreadable boundary')))
+    $mcWB = [Activator]::CreateInstance($mutableClockType)
+    $mcWB.Value = [datetime]'2026-09-08 23:59:59'
+    $localNowField.SetValue($stWB, [Func[datetime]]$mutableClockType.GetProperty('Now').GetValue($mcWB))
+    $script:clockWB = [long]0
+    $storeType.GetField('NowMs', $flags).SetValue($stWB, [Func[long]]{ param() $script:clockWB })
+    $storeRecordBlipM.Invoke($stWB, @()) | Out-Null          # pre-boundary delta blip
+    $readTextField.SetValue($stWB, (New-RealRead))
+    # Schedule recovery, then block it before its write.
+    $pauseWB = New-BlockGate
+    $storeType.GetField('RecoveryCapturePause', $flags).SetValue($stWB, [Func[bool]]$pauseWB.Gate)
+    $script:clockWB = 20000
+    $storeRecordBlipM.Invoke($stWB, @()) | Out-Null          # second blip: schedules recovery (delta=2, context=23:59:59)
+    # Advance across midnight and record a post-midnight blip into the delta.
+    $mcWB.Value = [datetime]'2026-09-09 00:00:01'
+    $storeRecordBlipM.Invoke($stWB, @()) | Out-Null          # delta=3, context now 00:00:01
+    $enteredWB = [bool]$pauseWB.Wait.Invoke(10000)
+    Check 'CORE-001: recovery entered its post-dequeue pause' $enteredWB
+    $null = $pauseWB.Open.Invoke()
+    $idleWB = [bool]$waitIdleM.Invoke($stWB, @([int]5000))
+    Check 'CORE-001: recovery settled after the boundary' $idleWB
+    $recWB = $stWB.Record
+    Check 'CORE-001: Total includes every delta blip (100 + 3)' ($recWB.TotalCount -eq 103) "total=$($recWB.TotalCount)"
+    Check 'CORE-001: the post-midnight blip lands in Today (not discarded by the stale key)' ($recWB.TodayCount -ge 1) "today=$($recWB.TodayCount) day=$($recWB.DayKey)"
+    Check 'CORE-001: recovered DayKey is the post-midnight day' ($recWB.DayKey -eq (Get-Key $dayKeyM ([datetime]'2026-09-09'))) "day=$($recWB.DayKey)"
+    Check 'CORE-001: pending delta cleared exactly once' ($pendingField.GetValue($stWB).TotalCount -eq 0) "total=$($pendingField.GetValue($stWB).TotalCount)"
+    $storeType.GetField('RecoveryCapturePause', $flags).SetValue($stWB, $null)
+    $stWB.Flush() | Out-Null
+
+    # ==================== PERF-001: SnapshotTotal primitive ====================
+    $snapshotTotalM = $storeType.GetMethod('SnapshotTotal')
+    $recordField = $storeType.GetField('Record', $flags)
+    $dirTC = Join-Path $work 'perfTotal'; New-Item -ItemType Directory -Path $dirTC | Out-Null
+    $stTC = New-Store $dirTC $D0
+    $localNowField.SetValue($stTC, [Func[datetime]]{ param() $D0 })
+    $recTC = $recordField.GetValue($stTC)
+    $recTC.DayKey = (Get-Key $dayKeyM $D0); $recTC.TodayCount = 3
+    $recTC.WeekKey = (Get-Key $weekKeyM $D0); $recTC.WeekCount = 5
+    $recTC.MonthKey = (Get-Key $monthKeyM $D0); $recTC.MonthCount = 7
+    $recTC.TotalCount = 42
+    Check 'PERF-001 SnapshotTotal returns the sanitized total only' `
+        ([long]$snapshotTotalM.Invoke($stTC, @()) -eq 42) "total=$([long]$snapshotTotalM.Invoke($stTC, @()))"
+    $recTC.TotalCount = -9
+    Check 'PERF-001 SnapshotTotal sanitizes a negative persisted total to 0' ([long]$snapshotTotalM.Invoke($stTC, @()) -eq 0)
+    $recTC.TotalCount = [long]::MaxValue
+    Check 'PERF-001 SnapshotTotal saturates at long.MaxValue' ([long]$snapshotTotalM.Invoke($stTC, @()) -eq [long]::MaxValue)
+
 } finally {
     if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
 }

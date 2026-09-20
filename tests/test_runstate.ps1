@@ -338,6 +338,44 @@ namespace Problip {
     $stallField.SetValue($eR, $null)
     $nowMsField.SetValue($eR, $nowMsField.GetValue($eR))  # keep the fake for the rest of this engine's life
 
+    # ---- PERF-002: StateChanged is edge-triggered, not per operation ----
+    $rE2 = & $newEngine $goodWav 5000 5000
+    $eE2 = $rE2.E; $tE2 = & $timerOf $eE2
+    $script:firedE2 = 0
+    $hE2 = [EventHandler]{ param($o, $ea) $script:firedE2++ }
+    $eE2.add_StateChanged($hE2)
+    try {
+        # healthy OFF preview: no observable edge.
+        $before = $script:firedE2
+        [void]$engineType.GetMethod('Preview').Invoke($eE2, @())
+        Check 'PERF-002: a healthy OFF Preview emits zero StateChanged' ($script:firedE2 -eq $before) "fired=$($script:firedE2 - $before)"
+        # start -> exactly one edge.
+        $before = $script:firedE2
+        $eE2.Start()
+        Check 'PERF-002: OFF->ON Start emits exactly one StateChanged' ($script:firedE2 -eq $before + 1) "fired=$($script:firedE2 - $before)"
+        # healthy ON preview: no edge.
+        $before = $script:firedE2
+        [void]$engineType.GetMethod('Preview').Invoke($eE2, @())
+        Check 'PERF-002: a healthy ON Preview emits zero StateChanged' ($script:firedE2 -eq $before) "fired=$($script:firedE2 - $before)"
+        # stop -> exactly one edge.
+        $before = $script:firedE2
+        $eE2.Stop()
+        Check 'PERF-002: ON->OFF Stop emits exactly one StateChanged' ($script:firedE2 -eq $before + 1) "fired=$($script:firedE2 - $before)"
+        # repeated stop while already OFF: no edge.
+        $before = $script:firedE2
+        $eE2.Stop()
+        Check 'PERF-002: a repeated Stop while already OFF emits zero StateChanged' ($script:firedE2 -eq $before) "fired=$($script:firedE2 - $before)"
+        # ERR -> playable OFF preview recovery emits exactly one edge.
+        $eE2.Start()
+        $playerField.SetValue($eE2, (New-Object System.Media.SoundPlayer (Join-Path $work 'perf-edge-gone.wav')))
+        $tickMethod.Invoke($eE2, @($null, [EventArgs]::Empty))   # ON -> ERR
+        $playerField.SetValue($eE2, (New-Object System.Media.SoundPlayer $goodWav))
+        $before = $script:firedE2
+        $okRec = [bool]$engineType.GetMethod('Preview').Invoke($eE2, @())   # ERR -> playable OFF
+        Check 'PERF-002: ERR->playable OFF Preview emits exactly one StateChanged' `
+            ($okRec -and $script:firedE2 -eq $before + 1) "ok=$okRec fired=$($script:firedE2 - $before)"
+    } finally { $eE2.remove_StateChanged($hE2) }
+
     # ---- source contracts the wave names explicitly ----
     # -Encoding UTF8: Problip.cs carries a UTF-8 BOM and the tray caption uses
     # a real em dash. A BOM-less harness read as ANSI would decode the em-dash

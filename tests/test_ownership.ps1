@@ -90,6 +90,35 @@ namespace Problip {
     Check 'ownership name is deterministic across processes' ($name -eq $secondRun)
     Check 'ownership name has fixed SHA-256 shape' ($name -match '^Global\\Problip\.Persistence\.[0-9A-F]{64}$') $name
 
+    # ---- W2-003: physical-directory identity, not lexical path spelling ----
+    # A directory junction (or symbolic link) resolving to the SAME physical
+    # directory must yield the SAME ownership name; otherwise two aliased
+    # processes could both admit a writer to one INI/statistics pair.
+    $realDir = Join-Path $work 'phys-real'
+    New-Item -ItemType Directory -Path $realDir | Out-Null
+    $linkDir = Join-Path $work 'phys-link'
+    $linkMade = $false
+    try {
+        New-Item -ItemType Junction -Path $linkDir -Target $realDir -ErrorAction Stop | Out-Null
+        $linkMade = $true
+    } catch {
+        # Fall back to a directory symbolic link when junction creation is denied.
+        try { New-Item -ItemType SymbolicLink -Path $linkDir -Target $realDir -ErrorAction Stop | Out-Null; $linkMade = $true } catch { $linkMade = $false }
+    }
+    if ($linkMade) {
+        $nameReal = Probe-Name $realDir
+        $nameLink = Probe-Name $linkDir
+        Check 'W2-003 a junction/symlink alias of one directory maps to one ownership name' ($nameReal -eq $nameLink) "real=$nameReal link=$nameLink"
+        $dotAlias = Probe-Name (Join-Path $linkDir '.')
+        Check 'W2-003 dot-form of an alias also converges' ($nameReal -eq $dotAlias)
+    } else {
+        Check 'W2-003 an alias fixture could be created (junction or symlink)' $false 'alias creation denied'
+    }
+    # A genuinely absent directory fails closed (no ambiguous second writer).
+    $missingExit = 0
+    try { [void](Probe-Name (Join-Path $work 'does-not-exist-dir')); $missingExit = 1 } catch { $missingExit = 2 }
+    Check 'W2-003 an unresolvable directory fails closed' ($missingExit -eq 2) "outcome=$missingExit"
+
     $readyA = Join-Path $work 'ready-a'
     $writes = Join-Path $work 'writes.txt'
     $ownerA = Start-Owner $dirA $readyA $writes 'owner-a' 5000

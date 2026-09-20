@@ -193,6 +193,54 @@ try {
     } else {
         Check 'the shipped 16-bit blip01.wav still loads successfully' $false "not found at $RealWav"
     }
+
+    # PERF-003: direct 32-bit scaling vectors. Drive the REAL compiled ScaleWav
+    # and compare to an independently computed little-endian expectation.
+    $wiType = $engineType.GetNestedType('WavInfo', [Reflection.BindingFlags]'Public,NonPublic')
+    $dirT32 = Join-Path $sandbox ([Guid]::NewGuid().ToString('N')); New-Item -ItemType Directory -Path $dirT32 | Out-Null
+    $sT32 = $settingsCtor.Invoke(@([string]$dirT32))
+    $eT32 = $engineCtor.Invoke(@($sT32))
+    $vals32 = [int[]]@([int]::MinValue, [int]::MaxValue, -1, 0, 1, 123456789, -987654321)
+    $payload32 = New-Object byte[] ($vals32.Length * 4)
+    for ($i = 0; $i -lt $vals32.Length; $i++) {
+        [Array]::Copy([BitConverter]::GetBytes([int]$vals32[$i]), 0, $payload32, $i * 4, 4)
+    }
+    function Expected32([int]$v, [double]$gain) {
+        $n = [long][Math]::Round([double]$v * $gain)
+        if ($n -gt [int]::MaxValue) { $n = [int]::MaxValue } elseif ($n -lt [int]::MinValue) { $n = [int]::MinValue }
+        return [BitConverter]::GetBytes([int]$n)
+    }
+    $scaleOk = $true; $scaleDetail = ''
+    function New-WavInfo { return [Array]::CreateInstance($wiType, 1).GetValue(0) }
+    $wi32 = New-WavInfo
+    $wi32.BitsPerSample = 32; $wi32.DataStart = 0; $wi32.DataLength = $payload32.Length; $wi32.BlockAlign = 4
+    foreach ($gain in @(0.0, 0.05, 0.5)) {
+        $in32 = [byte[]]$payload32.Clone()
+        $out32 = [byte[]]$scaleWav.Invoke($eT32, @([object]$in32, [object]$wi32, [object][double]$gain))
+        for ($i = 0; $i -lt $vals32.Length; $i++) {
+            $got = [byte[]]@($out32[$i*4], $out32[$i*4+1], $out32[$i*4+2], $out32[$i*4+3])
+            $exp = Expected32 $vals32[$i] $gain
+            if ([Convert]::ToBase64String($got) -ne [Convert]::ToBase64String($exp)) {
+                $scaleOk = $false
+                $scaleDetail += "g=$gain v=$($vals32[$i]) got=$([Convert]::ToBase64String($got)) exp=$([Convert]::ToBase64String($exp)) "
+            }
+        }
+    }
+    Check '32-bit ScaleWav matches an independent little-endian expectation across gains' $scaleOk $scaleDetail
+    # int.Min/Max saturation under gain 1.0 (note: gain>=0.999999 is the identity
+    # fast path, so use 0.5 for a scaled saturation probe).
+    $satLow = Expected32 ([int]::MinValue) 1.0
+    $satHigh = Expected32 ([int]::MaxValue) 1.0
+    Check '32-bit saturation expectations hold for extreme values' `
+        ($satLow[3] -eq 0x80 -and $satHigh[3] -eq 0x7F) "lo=$([Convert]::ToBase64String($satLow)) hi=$([Convert]::ToBase64String($satHigh))"
+    # Determinism across repeated scalings of a substantial payload.
+    $big = New-Object byte[] 40000
+    for ($i = 0; $i -lt $big.Length; $i++) { $big[$i] = [byte]($i % 251) }
+    $wiBig = New-WavInfo
+    $wiBig.BitsPerSample = 32; $wiBig.DataStart = 0; $wiBig.DataLength = $big.Length; $wiBig.BlockAlign = 4
+    $r1 = [byte[]]$scaleWav.Invoke($eT32, @([object]([byte[]]$big.Clone()), [object]$wiBig, [object][double]0.3))
+    $r2 = [byte[]]$scaleWav.Invoke($eT32, @([object]([byte[]]$big.Clone()), [object]$wiBig, [object][double]0.3))
+    Check 'repeated 32-bit scaling of a large payload is deterministic' ([Convert]::ToBase64String($r1) -eq [Convert]::ToBase64String($r2)) "len=$($r1.Length)"
 } finally {
     Remove-Item -LiteralPath $sandbox -Recurse -Force -ErrorAction SilentlyContinue
 }
@@ -207,6 +255,8 @@ $nextMethod = $text.IndexOf('int NextDelay()', $scaleStart)
 $scaleBody = if ($scaleStart -ge 0 -and $nextMethod -ge 0) { $text.Substring($scaleStart, $nextMethod - $scaleStart) } else { '' }
 Check 'ScaleWav carries no second chunk scanner (no while loop)' ($scaleBody -notmatch '\bwhile\b')
 Check 'ScaleWav carries no second chunk scanner (no chunk-id decode)' ($scaleBody -notmatch 'GetString')
+# PERF-003: the supported 32-bit branch must not allocate a byte[] per sample.
+Check 'the 32-bit scaling branch allocates no per-sample byte array' ($scaleBody -notmatch 'BitConverter\.GetBytes')
 
 Write-Host '---'
 if ($fails) { Write-Host "FAILED ($fails failure(s))"; exit 1 }

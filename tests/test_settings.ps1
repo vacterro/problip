@@ -538,6 +538,91 @@ namespace Problip {
     Check 'a fresh INI stores ThemeId=theme_classic and BlipGlow=1' `
         ($ini35 -match 'ThemeId=theme_classic' -and $ini35 -match 'BlipGlow=1') $ini35.Trim()
 
+    # ---- W2-001: unreadable existing baseline is a distinct state ----
+    # An existing-but-unreadable configuration must NOT be treated as fresh
+    # defaults: no fabricated RunOnLaunch/AutoStart projection, no Run-key
+    # mutation, no overwrite. Whole-file readability is a separate mechanism
+    # from the ambiguous profile reads; the ReadIniText seam is injectable so a
+    # regression forces the failure deterministically.
+    $runStateType = $asm.GetType('Problip.RunState', $true)
+    $engineType = $asm.GetType('Problip.BlipEngine', $true)
+    $staticFlags = [Reflection.BindingFlags]'Static,Public,NonPublic'
+    $startCmdType = $asm.GetType('Problip.StartupCommands', $true)
+    $loadStateField = $type.GetField('LoadState', $flags)
+    $isUsableProp = $type.GetProperty('IsUsable', $flags)
+    $readIniField = $type.GetField('ReadIniText', $flags)
+    $stateEnum = $asm.GetType('Problip.Settings+SettingsLoadState', $true)
+    $missingSt = [System.Enum]::Parse($stateEnum, 'Missing')
+    $healthySt = [System.Enum]::Parse($stateEnum, 'Healthy')
+    $unreadableSt = [System.Enum]::Parse($stateEnum, 'Unreadable')
+    $applyLaunchM = $runStateType.GetMethod('ApplyLaunch')
+    $projectStartupM = $startCmdType.GetMethod('ProjectAtStartup', $staticFlags)
+    $regSetF = $startCmdType.GetField('RegSet', $staticFlags)
+    $regClearF = $startCmdType.GetField('RegClear', $staticFlags)
+    $projHealthyF = $startCmdType.GetField('ProjectionHealthy', $staticFlags)
+
+    # fresh absent INI -> Missing, usable, RUNONLAUNCH default true
+    $dAbs = Join-Path $work 'w2_1_absent'; New-Item -ItemType Directory -Path $dAbs | Out-Null
+    $sAbs = $ctor.Invoke(@([string]$dAbs)); $sAbs.Load()
+    Check 'W2-001 an absent INI loads as Missing' ($loadStateField.GetValue($sAbs) -eq $missingSt) "state=$($loadStateField.GetValue($sAbs))"
+    Check 'W2-001 an absent INI is usable' ([bool]$isUsableProp.GetValue($sAbs, $null))
+
+    # existing readable INI -> Healthy with the stored values honored
+    $dH = Join-Path $work 'w2_1_healthy'; New-Item -ItemType Directory -Path $dH | Out-Null
+    Set-Content -LiteralPath (Join-Path $dH 'problip.ini') -NoNewline -Value "[problip]`r`nAutoStart=1`r`nRunOnLaunch=0`r`nVolume=0.33`r`n"
+    $sH = $ctor.Invoke(@([string]$dH)); $sH.Load()
+    Check 'W2-001 an existing readable INI loads as Healthy' ($loadStateField.GetValue($sH) -eq $healthySt) "state=$($loadStateField.GetValue($sH))"
+    Check 'W2-001 a healthy load honors stored AutoStart/RunOnLaunch' ($sH.AutoStart -and -not $sH.RunOnLaunch -and [Math]::Abs($sH.Volume - 0.33) -lt 1e-9)
+
+    # existing readable INI whose read is forced to FAIL -> Unreadable, defaults
+    $dU = Join-Path $work 'w2_1_unreadable'; New-Item -ItemType Directory -Path $dU | Out-Null
+    $iniU = Join-Path $dU 'problip.ini'
+    Set-Content -LiteralPath $iniU -NoNewline -Value "[problip]`r`nAutoStart=1`r`nRunOnLaunch=0`r`nVolume=0.44`r`n"
+    $bytesU = [IO.File]::ReadAllBytes($iniU)
+    $sU = $ctor.Invoke(@([string]$dU))
+    $readIniField.SetValue($sU, [Func[string,string]]{ param($p) throw [IO.IOException]::new('unreadable baseline') })
+    try { $sU.Load() } catch { }
+    Check 'W2-001 an unreadable existing INI loads as Unreadable' ($loadStateField.GetValue($sU) -eq $unreadableSt) "state=$($loadStateField.GetValue($sU))"
+    Check 'W2-001 an unreadable baseline is not usable' (-not [bool]$isUsableProp.GetValue($sU, $null))
+    $bytesU2 = [IO.File]::ReadAllBytes($iniU)
+    Check 'W2-001 an unreadable baseline leaves the INI byte-for-byte untouched' ([Convert]::ToBase64String($bytesU) -eq [Convert]::ToBase64String($bytesU2))
+
+    # RunState.ApplyLaunch must NOT auto-start from a fabricated RunOnLaunch=true
+    $engU = $engineType.GetConstructors($flags)[0].Invoke(@($sU))
+    try {
+        $sU.WavPath = [string](Join-Path $root 'blip01.wav'); $sU.Volume = 0.0
+        $applyLaunchM.Invoke($null, @([object]$sU, [object]$engU))
+        Check 'W2-001 an unreadable baseline does not auto-start the beeper' (-not $engU.IsOn) "on=$($engU.IsOn)"
+    } finally { try { $engU.Cleanup() } catch { } }
+
+    # ProjectAtStartup must NOT clear/set the Run key from fabricated defaults
+    $origSet = $regSetF.GetValue($null); $origClear = $regClearF.GetValue($null)
+    $script:reg1Calls = 0
+    try {
+        $regSetF.SetValue($null, [System.Func[string,string,bool]]{ param($k, $e) $script:reg1Calls++; return $true })
+        $regClearF.SetValue($null, [System.Func[string,bool]]{ param($k) $script:reg1Calls++; return $true })
+        $projHealthyF.SetValue($null, $true)
+        $projectStartupM.Invoke($null, @([object]$sU, [string]'Software\ProblipW21', [string]'x.exe'))
+        Check 'W2-001 an unreadable baseline performs zero Run-key projections' ($script:reg1Calls -eq 0) "calls=$($script:reg1Calls)"
+        Check 'W2-001 an unreadable baseline degrades projection health' (-not [bool]$projHealthyF.GetValue($null))
+    } finally {
+        $regSetF.SetValue($null, $origSet); $regClearF.SetValue($null, $origClear)
+        $projHealthyF.SetValue($null, $true)
+    }
+
+    # restoring reads recovers the exact stored preferences and normal projection
+    $sU2 = $ctor.Invoke(@([string]$dU)); $sU2.Load()
+    Check 'W2-001 restoring reads recovers the stored preferences' `
+        ($loadStateField.GetValue($sU2) -eq $healthySt -and $sU2.AutoStart -and -not $sU2.RunOnLaunch -and [Math]::Abs($sU2.Volume - 0.44) -lt 1e-9) `
+        "state=$($loadStateField.GetValue($sU2)) auto=$($sU2.AutoStart) run=$($sU2.RunOnLaunch) vol=$($sU2.Volume)"
+
+    # a genuinely absent INI still receives the documented fresh defaults
+    $dF = Join-Path $work 'w2_1_fresh'; New-Item -ItemType Directory -Path $dF | Out-Null
+    $sF = $ctor.Invoke(@([string]$dF)); $sF.Load()
+    Check 'W2-001 a genuinely absent INI still gets fresh defaults AutoStart=0/RunOnLaunch=1' `
+        ((-not $sF.AutoStart) -and $sF.RunOnLaunch -and $loadStateField.GetValue($sF) -eq $missingSt) `
+        "state=$($loadStateField.GetValue($sF)) auto=$($sF.AutoStart) run=$($sF.RunOnLaunch)"
+
     # ---- W2-002: failure-atomic interval transaction ----
     # SaveIntervalState is no longer rollback-based: a sibling candidate is
     # prepared, verified, and atomically committed. Every failure point must

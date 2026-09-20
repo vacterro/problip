@@ -632,6 +632,47 @@ try {
         try { $editor.Dispose() } catch { }
     }
 
+    # ---- PERF-001: HotZone graph is REUSED, not rebuilt per paint ----
+    # Glow drives paints at a 16 ms cadence; the old OnPaint allocated 18-19
+    # HotZone objects and 6 capturing closures per paint. Capture the zone
+    # identities and the list count, paint many times, and assert the SAME
+    # instances survive (only geometry updated).
+    $hotField = $formType.GetField('Hot', $nonPublic)
+    $bmpZone = New-Object System.Drawing.Bitmap 280, 216
+    $gZone = [System.Drawing.Graphics]::FromImage($bmpZone)
+    try {
+        $peZone = New-Object System.Windows.Forms.PaintEventArgs $gZone, (New-Object System.Drawing.Rectangle 0, 0, 280, 216)
+        try { $onPaint.Invoke($form, [object[]]@([System.Windows.Forms.PaintEventArgs]$peZone)) } finally { $peZone.Dispose() }
+        $hot0 = @($hotField.GetValue($form))
+        $ids0 = @($hot0 | ForEach-Object { [System.Runtime.CompilerServices.RuntimeHelpers]::GetHashCode($_) })
+        $count0 = $hot0.Count
+        $presetZonesField = $formType.GetField('PresetZones', $nonPublic)
+        $preset0 = @($presetZonesField.GetValue($form))
+        for ($i = 0; $i -lt 1000; $i++) {
+            try { $onPaint.Invoke($form, [object[]]@([System.Windows.Forms.PaintEventArgs]$peZone)) } catch { }
+        }
+        $hot1 = @($hotField.GetValue($form))
+        $ids1 = @($hot1 | ForEach-Object { [System.Runtime.CompilerServices.RuntimeHelpers]::GetHashCode($_) })
+        $count1 = $hot1.Count
+        $sameIds = ($count0 -eq $count1)
+        if ($sameIds) {
+            for ($i = 0; $i -lt $count0; $i++) {
+                if (-not [object]::ReferenceEquals($hot0[$i], $hot1[$i])) { $sameIds = $false; break }
+            }
+        }
+        Check 'PERF-001: the same HotZone instances are reused across 1000 paints' $sameIds "count=$count0->$count1"
+        $preset1 = @($presetZonesField.GetValue($form))
+        $presetSame = ($preset0.Count -eq $preset1.Count)
+        if ($presetSame) {
+            for ($i = 0; $i -lt $preset0.Count; $i++) {
+                if (-not [object]::ReferenceEquals($preset0[$i], $preset1[$i])) { $presetSame = $false; break }
+            }
+        }
+        Check 'PERF-001: the six preset HotZones and their Actions stay stable across paints' $presetSame
+        # Same clickable geometry count as before the fix.
+        Check 'PERF-001: the clickable region count is preserved (19 with the counter visible)' ($count1 -eq 19) "count=$count1"
+    } finally { $gZone.Dispose(); $bmpZone.Dispose() }
+
     # ---- hiding the counter: BLIPS rect empty, controls still fit ----
     $settings.ShowBlipCounter = $false
     $bmpHide = New-Object System.Drawing.Bitmap 280, 240

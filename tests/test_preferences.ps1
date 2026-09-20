@@ -459,12 +459,17 @@ namespace Problip {
     # failed registry projection never persists success: a Run-key path beyond
     # the 255-character registry limit cannot be created, so Set() fails and
     # the INI must still read AutoStart=0 (success never projected).
+    # W2-002: an indeterminate forward result now triggers a compensating
+    # reconciliation back to the previous intent. Here the SAME bad key also
+    # makes that reconciliation unverifiable, so the outcome is the explicit
+    # ForwardProjectionUnrestored (never the misleading "unchanged" phrasing).
     $s9b = New-SetIn (New-Dir 'autob') @{ AutoStart='0' }
     $badKey = 'Software\ProblipTest_' + ([string]'a' * 300)
     $resAutoB = $setAutoStartM.Invoke($null, @([object]$s9b, [string]$badKey, [string]$exePath))
+    $resUnrestored = [enum]::Parse($resultEnum, 'ForwardProjectionUnrestored')
     $iniB = Get-Content -LiteralPath (Join-Path $s9b.Dir 'problip.ini') -Raw
     Check 'a failed registry projection never persists success' `
-        ($resAutoB -eq $resFwdFail -and -not $s9b.AutoStart -and $iniB -match 'AutoStart=0') "res=$resAutoB auto=$($s9b.AutoStart)"
+        ($resAutoB -eq $resUnrestored -and -not $s9b.AutoStart -and $iniB -match 'AutoStart=0') "res=$resAutoB auto=$($s9b.AutoStart)"
     foreach ($k in @($disposableKey, $disposableKeyF)) {
         Remove-Item -LiteralPath "HKCU:\$k" -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -1011,11 +1016,65 @@ namespace Problip {
             ($msg16fwd -match 'startup entry' -and $msg16fwd -notmatch 'previous value') "msg=$($msg16fwd -replace "`r`n",' / ')"
         Check 'the rollback-success message states the previous value stays in effect' `
             ($msg16rollOk -match 'previous value stays in effect') "msg=$($msg16rollOk -replace "`r`n",' / ')"
+
+        # K9: FORWARD-side indeterminate failure. RegSet performs the real
+        # mutation then reports false (mutation landed but verification could not
+        # complete). W2-002 repair: the transaction must reconcile the registry
+        # back to the previous intent (verified Clear) and report
+        # ForwardProjectionFailed with projection health intact.
+        $key16h = 'Software\ProblipFwdH_' + [Guid]::NewGuid().ToString('N')
+        $s16k9 = New-SetIn (New-Dir 'w2k9') @{ AutoStart='0' }
+        $script:mutatedKey16 = $key16h
+        $regSetF16.SetValue($null, [System.Func[string,string,bool]]{
+            param($k, $e) [void]$autoStartType.GetMethod('Set', $staticFlags).Invoke($null, @([string]$k, [string]$e)); return $false })
+        $regClearF16.SetValue($null, $origClear16)
+        $projHealthyF16.SetValue($null, $true)
+        $res16k9 = $setAutoStartM.Invoke($null, @([object]$s16k9, [string]$key16h, [string]$exePath))
+        Check 'K9 forward mutation-then-false reports ForwardProjectionFailed after verified restore' `
+            ($res16k9 -eq $resFwdFail) "res=$res16k9"
+        Check 'K9 forward indeterminate failure reconciles the registry back to the previous OFF intent' `
+            (-not [bool]$isEnabledM13.Invoke($null, @([string]$key16h, [string]$exePath)))
+        Check 'K9 intent/INI stay OFF and projection health is restored' `
+            ((-not $s16k9.AutoStart) -and [bool]$projHealthyF16.GetValue($null)) "auto=$($s16k9.AutoStart)"
+
+        # K10: same but the compensating Clear ALSO fails -> the disagreement is
+        # observable and reported as ForwardProjectionUnrestored (never "the
+        # startup state was unchanged").
+        $key16i = 'Software\ProblipFwdI_' + [Guid]::NewGuid().ToString('N')
+        $s16k10 = New-SetIn (New-Dir 'w2k10') @{ AutoStart='0' }
+        $regSetF16.SetValue($null, [System.Func[string,string,bool]]{
+            param($k, $e) [void]$autoStartType.GetMethod('Set', $staticFlags).Invoke($null, @([string]$k, [string]$e)); return $false })
+        $regClearF16.SetValue($null, $falseClear16)
+        $projHealthyF16.SetValue($null, $true)
+        $res16k10 = $setAutoStartM.Invoke($null, @([object]$s16k10, [string]$key16i, [string]$exePath))
+        $resUnrestored16 = [enum]::Parse($resultEnum, 'ForwardProjectionUnrestored')
+        Check 'K10 forward indeterminate with failed compensation reports ForwardProjectionUnrestored' `
+            ($res16k10 -eq $resUnrestored16) "res=$res16k10"
+        Check 'K10 the registry disagreement stays observable' `
+            ([bool]$isEnabledM13.Invoke($null, @([string]$key16i, [string]$exePath)))
+        Check 'K10 projection health degrades truthfully' (-not [bool]$projHealthyF16.GetValue($null))
+        $msg16unr = [string]$resultTextM16.Invoke($null, @($res16k10, [object]$s16k10))
+        Check 'K10 the unrestored message does not claim the startup state was unchanged/restored' `
+            ($msg16unr -notmatch 'previous value stays in effect' -and $msg16unr -match 'could not be verified') "msg=$($msg16unr -replace "`r`n",' / ')"
+
+        # K11: previous ON, forward RegClear mutates then reports false ->
+        # compensated verified Set restores the ON intent.
+        $key16j = 'Software\ProblipFwdJ_' + [Guid]::NewGuid().ToString('N')
+        $s16k11 = New-SetIn (New-Dir 'w2k11') @{ AutoStart='1' }
+        [void]$autoStartType.GetMethod('Set', $staticFlags).Invoke($null, @([string]$key16j, [string]$exePath))
+        $regClearF16.SetValue($null, [System.Func[string,bool]]{
+            param($k) [void]$autoStartType.GetMethod('Clear', $staticFlags).Invoke($null, @([string]$k)); return $false })
+        $regSetF16.SetValue($null, $origSet16)
+        $projHealthyF16.SetValue($null, $true)
+        $res16k11 = $setAutoStartM.Invoke($null, @([object]$s16k11, [string]$key16j, [string]$exePath))
+        Check 'K11 previous-ON forward indeterminate restores the exact ON projection' `
+            (($res16k11 -eq $resFwdFail) -and $s16k11.AutoStart -and [bool]$isEnabledM13.Invoke($null, @([string]$key16j, [string]$exePath))) `
+            "res=$res16k11 auto=$($s16k11.AutoStart)"
     } finally {
         $regSetF16.SetValue($null, $origSet16)
         $regClearF16.SetValue($null, $origClear16)
         $projHealthyF16.SetValue($null, $true)
-        foreach ($k in @($key16a, $key16b, $key16c, $key16d, $key16e, $key16f, $key16g)) {
+        foreach ($k in @($key16a, $key16b, $key16c, $key16d, $key16e, $key16f, $key16g, $key16h, $key16i, $key16j)) {
 Remove-Item -LiteralPath "HKCU:\$k" -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
@@ -1259,6 +1318,41 @@ Remove-Item -LiteralPath "HKCU:\$k" -Recurse -Force -ErrorAction SilentlyContinu
     } finally {
         try { $prefs17.Dispose() } catch { }
         if ($hasPrefsAutoKeyField17) { Remove-Item -LiteralPath "HKCU:\$key17" -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    # ============ 18. CORE-002: Preferences participates in live theme projection ============
+    # Program.ApplyThemeToWindows must repaint the reusable Preferences window
+    # using its own ApplyTheme -- a registered, still-alive _prefsForm must have
+    # its BackColor follow the selected palette. Disposable registry/dirs only.
+    $d18 = New-Dir 'themeproj'
+    $s18 = New-SetIn $d18 @{ ThemeId='theme_classic' }
+    $prefs18 = $prefsFormType.GetConstructors($flags)[0].Invoke(@($s18, (New-EngineIn $d18 $s18)))
+    $applyThemeToWindowsM = $programType.GetMethod('ApplyThemeToWindows', $staticFlags)
+    $paletteType18 = $asm.GetType('Problip.Palette', $true)
+    $paletteCurrentF18 = $paletteType18.GetField('Current', $staticFlags)
+    $paletteForM18 = $asm.GetType('Problip.ThemeModel', $true).GetMethod('PaletteFor', $staticFlags)
+    $progPrefs18 = $programType.GetField('_prefsForm', $staticFlags)
+    $progForm18 = $programType.GetField('_form', $staticFlags)
+    $savedPalette18 = $paletteCurrentF18.GetValue($null)
+    $progPrefs18.SetValue($null, $prefs18)
+    $progForm18.SetValue($null, $null)
+    try {
+        foreach ($tid in @('theme_wintage_dracula', 'theme_wintage_nord', 'theme_wintage_oled')) {
+            $pal = $paletteForM18.Invoke($null, @([string]$tid))
+            $paletteCurrentF18.SetValue($null, $pal)
+            $applyThemeToWindowsM.Invoke($null, @())
+            $wantBg = $pal.GetType().GetField('BG').GetValue($pal)
+            $gotBg = $prefs18.BackColor
+            Check ("CORE-002: Preferences BackColor follows the selected palette (" + $tid + ")") `
+                ($gotBg.R -eq $wantBg.R -and $gotBg.G -eq $wantBg.G -and $gotBg.B -eq $wantBg.B) `
+                "want=$($wantBg) got=$($gotBg)"
+        }
+        Check 'CORE-002: the same registered Preferences instance is reused' ([object]::ReferenceEquals($progPrefs18.GetValue($null), $prefs18))
+    } finally {
+        $paletteCurrentF18.SetValue($null, $savedPalette18)
+        $progPrefs18.SetValue($null, $null)
+        $progForm18.SetValue($null, $null)
+        try { $prefs18.Dispose() } catch { }
     }
 } finally {
     if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
