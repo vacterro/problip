@@ -2,6 +2,8 @@
 
 <p align="left"><img src="assets/problip.png" width="96" height="96" alt="PROBLIP icon" /></p>
 
+[![CI](https://github.com/vacterro/problip/actions/workflows/ci.yml/badge.svg)](https://github.com/vacterro/problip/actions/workflows/ci.yml)
+
 A tiny Windows tray beeper for periodic attention or meditation cues. It sits
 quietly in the notification area and plays a short blip on the interval you
 choose — a randomized preset, a custom MANUAL range, or the alternating PULSE
@@ -319,14 +321,18 @@ Problip.cs                 the entire application (single source file)
 build.ps1                 direct-csc build
 package.ps1               clean release ZIP
 README.md
-problip.stats.ini         local statistics state (generated, never packaged)
+problip.example.ini       documented example configuration
 assets/problip.png         README logo (derived from the real icon)
 blip01.wav                beep asset, shipped beside the exe
 problip.ico               tray/window icon
 scripts/make_pixel_ico.py icon generator (nearest-neighbour, pixel style)
-tests/                    run_all.ps1 + harnesses
-.github/workflows/ci.yml  Windows CI
+tests/                    run_all.ps1 + regression harnesses
+.github/workflows/ci.yml  Windows CI (build + full test suite)
 ```
+
+`problip.ini` and `problip.stats.ini` are runtime user state, created beside the
+executable when the app runs; they are never part of the repository or a release
+package.
 
 ## Troubleshooting
 
@@ -336,6 +342,10 @@ tests/                    run_all.ps1 + harnesses
 - **No sound** — volume at 0, or the interval simply has not elapsed yet.
 - **Autostart did not take** — the Run-key write can fail if your account lacks
   permission; the toggle reports the real outcome rather than hiding it.
+- **Window does not open** — delete `problip.ini` (or restore
+  `problip.example.ini` over it) and start PROBLIP again; a fresh default
+  configuration is written on the next run. Your statistics in
+  `problip.stats.ini` are untouched by this.
 
 ## Autostart
 
@@ -345,5 +355,7 @@ current executable. An existing `AutoStart=1` in `problip.ini` is preserved.
 
 ## License
 
-No license is specified for this project. All rights reserved by default; the
-code is provided as-is without a grant of rights. See `LICENSE` if one is added.
+No license is specified for this project. All rights reserved by the author;
+the code is made publicly viewable but no rights are granted. Permission is not
+given to copy, modify, redistribute or create derivative works. No `LICENSE`
+file exists yet; if one is added later, it will appear in the repository root.
