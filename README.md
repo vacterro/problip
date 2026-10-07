@@ -1,14 +1,21 @@
+<div align="center">
+
+<img src="assets/problip.png" width="96" height="96" alt="PROBLIP icon">
+
 # PROBLIP
 
-<p align="left"><img src="assets/problip.png" width="96" height="96" alt="PROBLIP icon" /></p>
+**Tiny Windows tray beeper for periodic attention, meditation, and break cues.**
 
 [![CI](https://github.com/vacterro/problip/actions/workflows/ci.yml/badge.svg)](https://github.com/vacterro/problip/actions/workflows/ci.yml)
+![Platform](https://img.shields.io/badge/platform-Windows-0078D4?style=flat-square)
+![Runtime](https://img.shields.io/badge/runtime-.NET%20Framework-512BD4?style=flat-square)
+![Portable](https://img.shields.io/badge/install-portable-4A7A20?style=flat-square)
 
-A tiny Windows tray beeper for periodic attention or meditation cues. It sits
-quietly in the notification area and plays a short blip on the interval you
-choose — a randomized preset, a custom MANUAL range, or the alternating PULSE
-pattern — so a glance away or a breath happens on a schedule instead of on
-willpower.
+[Quick start](#quick-start) · [Controls](#controls) · [Preferences](#preferences--control-center) · [Troubleshooting](#troubleshooting)
+
+</div>
+
+PROBLIP stays in the notification area and plays a short cue on the interval you choose: randomized range presets, a custom manual range, or an alternating pulse pattern.
 
 ## Overview
 
